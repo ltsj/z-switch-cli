@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::proxy_log;
 
-pub const DEFAULT_PORT: u16 = 8899;
+pub const DEFAULT_PORT: u16 = 8999;
 pub const PROXY_APPS: &[&str] = &["claude", "codex", "grok"];
 pub const PLACEHOLDER_KEY: &str = "z-switch-proxy";
 

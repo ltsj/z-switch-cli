@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
     bin_name = "z-switch",
     version,
     about = "z-switch-cli · Claude Code / Codex / Grok 供应商一键切换命令行工具",
-    long_about = "专为 Claude Code、Codex CLI 与 Grok CLI 设计的极速、原生供应商管理与热切工具。\n支持直连与本地代理（127.0.0.1:8899）常驻后台热切双模式。"
+    long_about = "专为 Claude Code、Codex CLI 与 Grok CLI 设计的极速、原生供应商管理与热切工具。\n支持直连与本地代理（127.0.0.1:8999）常驻后台热切双模式。"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -69,7 +69,7 @@ pub enum Commands {
         #[arg(long, conflicts_with = "proxy")]
         direct: bool,
 
-        /// 本地代理端口（默认 8899）
+        /// 本地代理端口（默认 8999）
         #[arg(long)]
         port: Option<u16>,
     },
@@ -188,8 +188,8 @@ pub enum Commands {
 pub enum ProxyAction {
     /// 启动本地代理（默认后台常驻）
     Start {
-        /// 代理监听端口（默认 8899）
-        #[arg(short, long, default_value_t = 8899)]
+        /// 代理监听端口（默认 8999）
+        #[arg(short, long, default_value_t = 8999)]
         port: u16,
 
         /// 在前台运行（用于调试）
@@ -199,22 +199,22 @@ pub enum ProxyAction {
 
     /// 停止后台常驻代理
     Stop {
-        /// 代理端口（默认 8899）
-        #[arg(short, long, default_value_t = 8899)]
+        /// 代理端口（默认 8999）
+        #[arg(short, long, default_value_t = 8999)]
         port: u16,
     },
 
     /// 重启后台代理
     Restart {
-        /// 代理端口（默认 8899）
-        #[arg(short, long, default_value_t = 8899)]
+        /// 代理端口（默认 8999）
+        #[arg(short, long, default_value_t = 8999)]
         port: u16,
     },
 
     /// 查看本地代理运行状态与流量统计
     Status {
-        /// 代理端口（默认 8899）
-        #[arg(short, long, default_value_t = 8899)]
+        /// 代理端口（默认 8999）
+        #[arg(short, long, default_value_t = 8999)]
         port: u16,
     },
 
@@ -228,7 +228,7 @@ pub enum ProxyAction {
     /// 内部守护工作进程命令（供后台脱离进程调用）
     #[command(hide = true)]
     Worker {
-        #[arg(short, long, default_value_t = 8899)]
+        #[arg(short, long, default_value_t = 8999)]
         port: u16,
     },
 }
