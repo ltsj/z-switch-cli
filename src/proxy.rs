@@ -818,11 +818,14 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
         }
         "codex" => {
             let cfg = provider.settings_config.get("config")?.as_str()?;
-            let base = cfg
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("base_url"))
-                .and_then(|r| r.split('"').nth(1))
-                .map(|s| s.trim().to_string())?;
+            let base = cfg.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == "base_url" {
+                    Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                } else {
+                    None
+                }
+            })?;
             if base.is_empty() {
                 return None;
             }
@@ -843,11 +846,14 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
         }
         "grok" => {
             let cfg = provider.settings_config.get("config")?.as_str()?;
-            let base = cfg
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("models_base_url"))
-                .and_then(|r| r.split('"').nth(1))
-                .map(|s| s.trim().to_string())?;
+            let base = cfg.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == "models_base_url" || k.trim() == "base_url" {
+                    Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                } else {
+                    None
+                }
+            })?;
             if base.is_empty() {
                 return None;
             }

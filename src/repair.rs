@@ -46,10 +46,14 @@ pub fn read_codex() -> LiveSnapshot {
     let base_url = fs::read_to_string(config::get_codex_config_path())
         .ok()
         .and_then(|cfg| {
-            cfg.lines()
-                .find_map(|l| l.trim().strip_prefix("base_url"))
-                .and_then(|r| r.split('"').nth(1))
-                .map(|s| s.to_string())
+            cfg.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == "base_url" {
+                    Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                } else {
+                    None
+                }
+            })
         });
     let key_is_placeholder = fs::read_to_string(config::get_codex_auth_path())
         .ok()
@@ -58,6 +62,38 @@ pub fn read_codex() -> LiveSnapshot {
             v.get("OPENAI_API_KEY")
                 .and_then(|k| k.as_str())
                 .map(|s| s == PLACEHOLDER_KEY)
+        })
+        .unwrap_or(false);
+    LiveSnapshot {
+        base_url,
+        key_is_placeholder,
+    }
+}
+
+pub fn read_grok() -> LiveSnapshot {
+    let base_url = fs::read_to_string(config::get_grok_config_path())
+        .ok()
+        .and_then(|cfg| {
+            cfg.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == "models_base_url" || k.trim() == "base_url" {
+                    Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                } else {
+                    None
+                }
+            })
+        });
+    let key_is_placeholder = fs::read_to_string(config::get_grok_config_path())
+        .ok()
+        .and_then(|cfg| {
+            cfg.lines().find_map(|l| {
+                let (k, v) = l.trim().split_once('=')?;
+                if k.trim() == "api_key" || k.trim() == "grok_api_key" {
+                    Some(v.trim().trim_matches(['\"', '\'']) == PLACEHOLDER_KEY)
+                } else {
+                    None
+                }
+            })
         })
         .unwrap_or(false);
     LiveSnapshot {

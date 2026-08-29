@@ -459,11 +459,12 @@ impl SwitchService {
     pub fn diagnose(&self) -> Vec<DiagnosisResult> {
         let root = self.root.lock().unwrap();
         let mut list = Vec::new();
-        for &app in &["claude", "codex"] {
-            let snap = if app == "claude" {
-                repair::read_claude()
-            } else {
-                repair::read_codex()
+        for &app in &["claude", "codex", "grok"] {
+            let snap = match app {
+                "claude" => repair::read_claude(),
+                "codex" => repair::read_codex(),
+                "grok" => repair::read_grok(),
+                _ => continue,
             };
             let localhost = snap
                 .base_url

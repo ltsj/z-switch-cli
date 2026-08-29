@@ -55,13 +55,16 @@ z-switch test deepseek
 z-switch test --app claude --all               # 批量测速应用下的所有供应商
 ```
 
-#### 添加与删除
+#### 添加、编辑与删除
 ```bash
 # 命令行添加 Claude 供应商
 z-switch add --app claude --name "DeepSeek" --url "https://api.deepseek.com" --key "sk-xxxx" --model "deepseek-chat"
 
 # 命令行添加 Codex 供应商
 z-switch add --app codex --name "GLM" --url "https://open.bigmodel.cn/api/paas/v4" --key "sk-xxxx" --model "glm-4-plus"
+
+# 编辑供应商配置（修改 URL 或模型）
+z-switch edit deepseek --app claude --model "deepseek-reasoner"
 
 # 删除供应商
 z-switch remove deepseek --app claude
@@ -90,12 +93,22 @@ z-switch import cc-switch
 # 从本机当前客户端环境导入
 z-switch import live
 
-# 环境体检与诊断
+# 环境体检与诊断 (检查是否存在 127.0.0.1 代理占位残留)
 z-switch doctor
 
 # 一键修复配置与环境残留
 z-switch repair
 ```
+
+---
+
+## 🔄 与 GUI 版本的配置共享机制
+
+`z-switch-cli` 与桌面 GUI 版 `z-switch` 共享同一套配置：
+- **配置文件目录**：统一读写 `~/.z-switch/providers.json`。
+- **备份与快照池**：统一存储于 `~/.z-switch/backups/`（自动维护最近 60 份快照并安全轮转）。
+- **端口隔离**：GUI 代理默认使用 `8899`，CLI 代理默认使用 `8999`，二者同时开启互不争抢端口。
+- **写入确定性**：采用原子写入与 JSON 键排序算法，多进程与并发调用安全无冲突。
 
 ---
 

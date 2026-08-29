@@ -148,6 +148,11 @@ pub async fn start_background(port: u16) -> Result<(), String> {
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let _child = cmd.spawn().map_err(|e| format!("拉起后台代理进程失败: {e}"))?;
 
