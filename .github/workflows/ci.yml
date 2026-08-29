@@ -97,18 +97,23 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build-artifacts
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+        with:
+          pattern: z-switch-*
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            z-switch-windows-x86_64.exe/z-switch-windows-x86_64.exe
-            z-switch-linux-x86_64/z-switch-linux-x86_64
-            z-switch-macos-arm64/z-switch-macos-arm64
-            z-switch-macos-x86_64/z-switch-macos-x86_64
+            z-switch-windows-x86_64.exe
+            z-switch-linux-x86_64
+            z-switch-macos-arm64
+            z-switch-macos-x86_64
           draft: false
           prerelease: false
           generate_release_notes: true
