@@ -84,17 +84,27 @@ impl Provider {
                 .map(|s| s.to_string()),
             "codex" => {
                 let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
-                cfg.lines()
-                    .find_map(|l| l.trim().strip_prefix("base_url"))
-                    .and_then(|r| r.split('"').nth(1))
-                    .map(|s| s.to_string())
+                cfg.lines().find_map(|l| {
+                    let trimmed = l.trim();
+                    let (k, v) = trimmed.split_once('=')?;
+                    if k.trim() == "base_url" {
+                        Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                    } else {
+                        None
+                    }
+                })
             }
             "grok" => {
                 let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
-                cfg.lines()
-                    .find_map(|l| l.trim().strip_prefix("models_base_url"))
-                    .and_then(|r| r.split('"').nth(1))
-                    .map(|s| s.to_string())
+                cfg.lines().find_map(|l| {
+                    let trimmed = l.trim();
+                    let (k, v) = trimmed.split_once('=')?;
+                    if k.trim() == "models_base_url" || k.trim() == "base_url" {
+                        Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                    } else {
+                        None
+                    }
+                })
             }
             _ => None,
         }
@@ -141,17 +151,27 @@ impl Provider {
             }
             "codex" => {
                 let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
-                cfg.lines()
-                    .find_map(|l| l.trim().strip_prefix("model"))
-                    .and_then(|r| r.split('"').nth(1))
-                    .map(|s| s.to_string())
+                cfg.lines().find_map(|l| {
+                    let trimmed = l.trim();
+                    let (k, v) = trimmed.split_once('=')?;
+                    if k.trim() == "model" {
+                        Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                    } else {
+                        None
+                    }
+                })
             }
             "grok" => {
                 let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
-                cfg.lines()
-                    .find_map(|l| l.trim().strip_prefix("model"))
-                    .and_then(|r| r.split('"').nth(1))
-                    .map(|s| s.to_string())
+                cfg.lines().find_map(|l| {
+                    let trimmed = l.trim();
+                    let (k, v) = trimmed.split_once('=')?;
+                    if k.trim() == "model" {
+                        Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                    } else {
+                        None
+                    }
+                })
             }
             _ => None,
         }
@@ -378,3 +398,67 @@ pub fn load() -> Root {
 pub fn save(root: &Root) -> Result<(), String> {
     config::write_json_file(&config::get_store_path(), root)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_claude() {
+        let p = Provider {
+            id: "deepseek".into(),
+            name: "DeepSeek".into(),
+            category: Some("custom".into()),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.deepseek.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-123456",
+                    "ANTHROPIC_MODEL": "deepseek-chat"
+                }
+            }),
+            meta: json!({ "apiKeyField": "ANTHROPIC_AUTH_TOKEN" }),
+            failover: json!({ "enabled": false }),
+        };
+
+        assert_eq!(p.extract_base_url("claude").as_deref(), Some("https://api.deepseek.com"));
+        assert_eq!(p.extract_api_key("claude").as_deref(), Some("sk-123456"));
+        assert_eq!(p.extract_model("claude").as_deref(), Some("deepseek-chat"));
+        assert_eq!(p.extract_api_key_field("claude").as_deref(), Some("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn test_extract_codex() {
+        let p = Provider {
+            id: "glm".into(),
+            name: "GLM-4".into(),
+            category: Some("custom".into()),
+            settings_config: json!({
+                "auth": { "OPENAI_API_KEY": "glm-token-xyz" },
+                "config": "model_provider = \"custom\"\nmodel = \"glm-4-plus\"\n\n[model_providers.custom]\nbase_url = \"https://open.bigmodel.cn/api/paas/v4\"\nwire_api = \"chat\"\n"
+            }),
+            meta: json!({ "wireApi": "chat" }),
+            failover: json!({ "enabled": false }),
+        };
+
+        assert_eq!(p.extract_base_url("codex").as_deref(), Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(p.extract_api_key("codex").as_deref(), Some("glm-token-xyz"));
+        assert_eq!(p.extract_model("codex").as_deref(), Some("glm-4-plus"));
+        assert_eq!(p.extract_wire_api("codex"), "chat");
+    }
+
+    #[test]
+    fn test_ensure_official_providers() {
+        let mut root = Root {
+            version: 1,
+            apps: HashMap::new(),
+            settings: json!({}),
+        };
+        let changed = root.ensure_official_providers();
+        assert!(changed);
+        assert_eq!(root.version, 3);
+        assert!(root.apps.contains_key("claude"));
+        assert!(root.apps.contains_key("codex"));
+        assert!(root.apps.contains_key("grok"));
+    }
+}
+

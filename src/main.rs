@@ -261,6 +261,111 @@ async fn main() {
             }
         }
 
+        Some(Commands::Edit {
+            query,
+            app,
+            name,
+            url,
+            key,
+            model,
+        }) => {
+            let app_name = app
+                .map(|a| a.as_str().to_string())
+                .or(target_app_default)
+                .unwrap_or_else(|| "claude".to_string());
+
+            if let Some(q) = query {
+                let root = service.get_root();
+                let data = match root.apps.get(&app_name) {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("{} 未知应用: {app_name}", "✖".bright_red());
+                        std::process::exit(1);
+                    }
+                };
+                if let Some((_, old_p)) = SwitchService::find_provider(data, &q) {
+                    if store::is_official_provider(old_p) {
+                        eprintln!("{} 官方基线供应商不可修改", "✖".bright_red());
+                        std::process::exit(1);
+                    }
+                    let mut new_p = old_p.clone();
+                    if let Some(n) = name {
+                        new_p.name = n;
+                    }
+                    let target_url = url
+                        .or_else(|| old_p.extract_base_url(&app_name))
+                        .unwrap_or_default();
+                    let target_key = key
+                        .or_else(|| old_p.extract_api_key(&app_name))
+                        .unwrap_or_default();
+                    let target_model = model
+                        .or_else(|| old_p.extract_model(&app_name))
+                        .unwrap_or_default();
+
+                    match app_name.as_str() {
+                        "claude" => {
+                            let kf = old_p
+                                .extract_api_key_field("claude")
+                                .unwrap_or_else(|| "ANTHROPIC_AUTH_TOKEN".to_string());
+                            let mut env = serde_json::json!({
+                                "ANTHROPIC_BASE_URL": target_url,
+                                kf.clone(): target_key,
+                            });
+                            if !target_model.is_empty() {
+                                if let Some(obj) = env.as_object_mut() {
+                                    obj.insert(
+                                        "ANTHROPIC_MODEL".into(),
+                                        serde_json::Value::String(target_model),
+                                    );
+                                }
+                            }
+                            new_p.settings_config = serde_json::json!({ "env": env });
+                        }
+                        "codex" => {
+                            let wire = old_p.extract_wire_api("codex");
+                            let toml_config = format!(
+                                "model_provider = \"custom\"\nmodel = \"{target_model}\"\n\n[model_providers.custom]\nbase_url = \"{target_url}\"\nwire_api = \"{wire}\"\n"
+                            );
+                            new_p.settings_config = serde_json::json!({
+                                "auth": { "OPENAI_API_KEY": target_key },
+                                "config": toml_config
+                            });
+                        }
+                        "grok" => {
+                            let toml_config = format!(
+                                "models_base_url = \"{target_url}\"\nmodel = \"{target_model}\"\n"
+                            );
+                            new_p.settings_config = serde_json::json!({
+                                "auth": { "GROK_API_KEY": target_key },
+                                "config": toml_config
+                            });
+                        }
+                        _ => {
+                            eprintln!("{} 不支持的应用: {app_name}", "✖".bright_red());
+                            std::process::exit(1);
+                        }
+                    }
+
+                    match service.save_provider(&app_name, new_p) {
+                        Ok(p) => println!(
+                            "{} 成功修改供应商：{}",
+                            "✔".bright_green().bold(),
+                            p.name.bright_white().bold()
+                        ),
+                        Err(e) => {
+                            eprintln!("{} 修改失败: {e}", "✖".bright_red().bold());
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("{} 未找到供应商: {q}", "✖".bright_red());
+                    std::process::exit(1);
+                }
+            } else {
+                tui::interactive_edit(&service).await;
+            }
+        }
+
         Some(Commands::Remove { query, app, mode }) => {
             let app_name = app
                 .map(|a| a.as_str().to_string())

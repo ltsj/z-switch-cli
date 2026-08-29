@@ -159,6 +159,7 @@ pub async fn run_interactive_menu(service: &SwitchService) {
             "📋 查看所有供应商列表 (List Providers)",
             "⚡ 真实流式测速与验真 (Speed Test & TTFT)",
             "➕ 新增供应商 (Add Provider)",
+            "✏️ 编辑供应商配置 (Edit Provider)",
             "🗑️ 删除供应商 (Delete Provider)",
             "🌐 本地代理守护进程管理 (Proxy Daemon)",
             "🔄 导入供应商 (Import cc-switch / live)",
@@ -184,6 +185,9 @@ pub async fn run_interactive_menu(service: &SwitchService) {
             }
             opt if opt.starts_with("➕") => {
                 interactive_add(service).await;
+            }
+            opt if opt.starts_with("✏️") => {
+                interactive_edit(service).await;
             }
             opt if opt.starts_with("🗑️") => {
                 interactive_remove(service).await;
@@ -610,6 +614,147 @@ pub async fn interactive_add(service: &SwitchService) {
         }
         Err(e) => {
             println!("{} 添加失败: {e}", "✖".bright_red().bold());
+        }
+    }
+    println!();
+}
+
+pub async fn interactive_edit(service: &SwitchService) {
+    let app_choice = match Select::new(
+        "选择目标应用:",
+        vec![
+            "claude (Claude Code)",
+            "codex (Codex CLI)",
+            "grok (Grok CLI)",
+        ],
+    )
+    .prompt()
+    {
+        Ok(s) => s.split_whitespace().next().unwrap_or("claude").to_string(),
+        Err(_) => return,
+    };
+
+    let root = service.get_root();
+    let data = match root.apps.get(&app_choice) {
+        Some(d) if !d.order.is_empty() => d,
+        _ => {
+            println!("{}", "该应用暂无可编辑的供应商".bright_red());
+            return;
+        }
+    };
+
+    let mut provider_items = Vec::new();
+    for id in &data.order {
+        if let Some(p) = data.providers.get(id) {
+            if store::is_official_provider(p) {
+                continue;
+            }
+            provider_items.push(format!("{} ({})", p.name, p.id));
+        }
+    }
+
+    if provider_items.is_empty() {
+        println!("{}", "没有可编辑的第三方供应商".bright_yellow());
+        return;
+    }
+
+    let choice = match Select::new("选择要修改的供应商:", provider_items).prompt() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let id_part = choice.split('(').nth(1).unwrap_or("").trim_end_matches(')');
+    let old_p = match data.providers.get(id_part) {
+        Some(p) => p.clone(),
+        None => return,
+    };
+
+    let current_name = old_p.name.clone();
+    let current_url = old_p.extract_base_url(&app_choice).unwrap_or_default();
+    let current_key = old_p.extract_api_key(&app_choice).unwrap_or_default();
+    let current_model = old_p.extract_model(&app_choice).unwrap_or_default();
+
+    let new_name = match Text::new("修改名称 (回车保持原样):")
+        .with_default(&current_name)
+        .prompt()
+    {
+        Ok(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return,
+    };
+
+    let new_url = match Text::new("修改 Base URL (回车保持原样):")
+        .with_default(&current_url)
+        .prompt()
+    {
+        Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return,
+    };
+
+    let new_key = match Text::new("修改 API Key / Auth Token (回车保持原样):")
+        .with_default(&current_key)
+        .prompt()
+    {
+        Ok(k) => k.trim().to_string(),
+        _ => return,
+    };
+
+    let new_model = match Text::new("修改默认模型 (回车保持原样):")
+        .with_default(&current_model)
+        .prompt()
+    {
+        Ok(m) => m.trim().to_string(),
+        _ => String::new(),
+    };
+
+    let mut new_p = old_p.clone();
+    new_p.name = new_name;
+
+    match app_choice.as_str() {
+        "claude" => {
+            let kf = old_p
+                .extract_api_key_field("claude")
+                .unwrap_or_else(|| "ANTHROPIC_AUTH_TOKEN".to_string());
+            let mut env = serde_json::json!({
+                "ANTHROPIC_BASE_URL": new_url,
+                kf.clone(): new_key,
+            });
+            if !new_model.is_empty() {
+                if let Some(obj) = env.as_object_mut() {
+                    obj.insert("ANTHROPIC_MODEL".into(), serde_json::Value::String(new_model));
+                }
+            }
+            new_p.settings_config = serde_json::json!({ "env": env });
+        }
+        "codex" => {
+            let wire = old_p.extract_wire_api("codex");
+            let toml_config = format!(
+                "model_provider = \"custom\"\nmodel = \"{new_model}\"\n\n[model_providers.custom]\nbase_url = \"{new_url}\"\nwire_api = \"{wire}\"\n"
+            );
+            new_p.settings_config = serde_json::json!({
+                "auth": { "OPENAI_API_KEY": new_key },
+                "config": toml_config
+            });
+        }
+        "grok" => {
+            let toml_config = format!("models_base_url = \"{new_url}\"\nmodel = \"{new_model}\"\n");
+            new_p.settings_config = serde_json::json!({
+                "auth": { "GROK_API_KEY": new_key },
+                "config": toml_config
+            });
+        }
+        _ => return,
+    }
+
+    match service.save_provider(&app_choice, new_p) {
+        Ok(p) => {
+            println!(
+                "{} 成功修改供应商：{}",
+                "✔".bright_green().bold(),
+                p.name.bright_white().bold()
+            );
+        }
+        Err(e) => {
+            println!("{} 修改失败: {e}", "✖".bright_red().bold());
         }
     }
     println!();

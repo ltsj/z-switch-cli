@@ -127,5 +127,36 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
-pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sort_json_keys() {
+        let unsorted = serde_json::json!({
+            "z": 1,
+            "a": 2,
+            "m": {
+                "sub_b": 10,
+                "sub_a": 20
+            }
+        });
+        let sorted = sort_json_keys(&unsorted);
+        let serialized = serde_json::to_string(&sorted).unwrap();
+        assert_eq!(serialized, r#"{"a":2,"m":{"sub_a":20,"sub_b":10},"z":1}"#);
+    }
+
+    #[test]
+    fn test_atomic_write() {
+        let dir = std::env::temp_dir().join(format!("z_switch_test_{}", std::process::id()));
+        let file = dir.join("test.txt");
+        let content = b"hello z-switch atomic write";
+
+        let res = atomic_write(&file, content);
+        assert!(res.is_ok());
+        let read = fs::read(&file).unwrap();
+        assert_eq!(read, content);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+

@@ -56,6 +56,30 @@ pub fn backup_file(path: &Path, tag: &str) {
         .as_nanos();
     let dest = dir.join(format!("{tag}-{ts}.bak"));
     let _ = fs::copy(path, dest);
+    prune_old_backups(&dir, 60);
+}
+
+fn prune_old_backups(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                if let Ok(time) = meta.modified() {
+                    files.push((entry.path(), time));
+                }
+            }
+        }
+    }
+    if files.len() > keep {
+        files.sort_by_key(|(_, time)| *time);
+        let remove_count = files.len() - keep;
+        for (path, _) in files.into_iter().take(remove_count) {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub fn backup_current_app(app: &str) {
@@ -410,18 +434,26 @@ pub fn import_codex() -> Option<Provider> {
     if cfg.trim().is_empty() {
         return None;
     }
-    let base = cfg
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("base_url"))
-        .and_then(|r| r.split('"').nth(1))
-        .map(|s| s.to_string());
+    let base = cfg.lines().find_map(|l| {
+        let (k, v) = l.trim().split_once('=')?;
+        if k.trim() == "base_url" {
+            Some(v.trim().trim_matches(['\"', '\'']).to_string())
+        } else {
+            None
+        }
+    });
     let base = base.filter(|value| !value.trim().is_empty())?;
     let wire = cfg
         .lines()
-        .find_map(|l| l.trim().strip_prefix("wire_api"))
-        .and_then(|r| r.split('"').nth(1))
-        .unwrap_or("responses")
-        .to_string();
+        .find_map(|l| {
+            let (k, v) = l.trim().split_once('=')?;
+            if k.trim() == "wire_api" {
+                Some(v.trim().trim_matches(['\"', '\'']).to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "responses".to_string());
     let name = host_of(&base).unwrap_or_else(|| "导入的 Codex 供应商".to_string());
     let key = auth
         .as_ref()
@@ -446,12 +478,15 @@ pub fn import_grok() -> Option<Provider> {
     if cfg.trim().is_empty() {
         return None;
     }
-    let base = cfg
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("models_base_url"))
-        .and_then(|r| r.split('"').nth(1))
-        .map(|s| s.to_string())
-        .filter(|value| !value.trim().is_empty())?;
+    let base = cfg.lines().find_map(|l| {
+        let (k, v) = l.trim().split_once('=')?;
+        if k.trim() == "models_base_url" || k.trim() == "base_url" {
+            Some(v.trim().trim_matches(['\"', '\'']).to_string())
+        } else {
+            None
+        }
+    });
+    let base = base.filter(|value| !value.trim().is_empty())?;
     let name = host_of(&base).unwrap_or_else(|| "导入的 Grok 供应商".to_string());
     Some(Provider {
         id: "imported-current".to_string(),

@@ -123,6 +123,32 @@ pub enum Commands {
         wire_api: Option<String>,
     },
 
+    /// 修改现有供应商配置
+    Edit {
+        /// 供应商名称或 ID（留空则交互式选择）
+        query: Option<String>,
+
+        /// 目标应用
+        #[arg(short, long, value_enum)]
+        app: Option<AppType>,
+
+        /// 修改显示名称
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// 修改 Base URL
+        #[arg(short, long)]
+        url: Option<String>,
+
+        /// 修改 API Key
+        #[arg(short, long)]
+        key: Option<String>,
+
+        /// 修改默认模型
+        #[arg(short, long)]
+        model: Option<String>,
+    },
+
     /// 删除供应商
     #[command(alias = "rm", alias = "del")]
     Remove {
