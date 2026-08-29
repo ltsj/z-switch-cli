@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Claude Code VS Code 扩展放行与首次启动引导控制。
 use crate::config;
 use serde_json::{Map, Value};

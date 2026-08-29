@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 本地路由错误日志。
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
@@ -102,3 +103,46 @@ pub fn clear() -> Result<(), String> {
     }
     Ok(())
 }
+
+pub fn read_recent(tail: usize) -> Vec<serde_json::Value> {
+    let path = log_path();
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let mut entries = Vec::new();
+    for line in content.lines().rev().take(tail) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            entries.push(v);
+        }
+    }
+    entries.reverse();
+    entries
+}
+
+pub fn interactive_view(tail: usize) {
+    let entries = read_recent(tail);
+    if entries.is_empty() {
+        println!("  (暂无代理错误日志)");
+        return;
+    }
+    println!();
+    println!("── 最近 {} 条代理错误日志 ──", entries.len());
+    for item in entries {
+        let ts = item.get("timestampMs").and_then(|v| v.as_u64()).unwrap_or(0);
+        let app = item.get("app").and_then(|v| v.as_str()).unwrap_or("-");
+        let phase = item.get("phase").and_then(|v| v.as_str()).unwrap_or("-");
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_u64())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let detail = item.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        println!(
+            "[{}] [{}] (HTTP {}) phase: {} | {}",
+            ts, app, status, phase, detail
+        );
+    }
+    println!();
+}
+

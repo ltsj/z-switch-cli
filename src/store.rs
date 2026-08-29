@@ -73,6 +73,113 @@ pub struct Provider {
     pub failover: Value,
 }
 
+impl Provider {
+    pub fn extract_base_url(&self, app: &str) -> Option<String> {
+        match app {
+            "claude" => self
+                .settings_config
+                .get("env")
+                .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            "codex" => {
+                let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
+                cfg.lines()
+                    .find_map(|l| l.trim().strip_prefix("base_url"))
+                    .and_then(|r| r.split('"').nth(1))
+                    .map(|s| s.to_string())
+            }
+            "grok" => {
+                let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
+                cfg.lines()
+                    .find_map(|l| l.trim().strip_prefix("models_base_url"))
+                    .and_then(|r| r.split('"').nth(1))
+                    .map(|s| s.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn extract_api_key(&self, app: &str) -> Option<String> {
+        match app {
+            "claude" => {
+                let env = self.settings_config.get("env")?;
+                let key_field = self
+                    .meta
+                    .get("apiKeyField")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ANTHROPIC_AUTH_TOKEN");
+                env.get(key_field)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }
+            "codex" => self
+                .settings_config
+                .get("auth")
+                .and_then(|a| a.get("OPENAI_API_KEY"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            "grok" => {
+                let auth = self.settings_config.get("auth")?;
+                auth.get("GROK_API_KEY")
+                    .or_else(|| auth.get("XAI_API_KEY"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn extract_model(&self, app: &str) -> Option<String> {
+        match app {
+            "claude" => {
+                let env = self.settings_config.get("env")?;
+                env.get("ANTHROPIC_MODEL")
+                    .or_else(|| env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }
+            "codex" => {
+                let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
+                cfg.lines()
+                    .find_map(|l| l.trim().strip_prefix("model"))
+                    .and_then(|r| r.split('"').nth(1))
+                    .map(|s| s.to_string())
+            }
+            "grok" => {
+                let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
+                cfg.lines()
+                    .find_map(|l| l.trim().strip_prefix("model"))
+                    .and_then(|r| r.split('"').nth(1))
+                    .map(|s| s.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn extract_wire_api(&self, _app: &str) -> String {
+        self.meta
+            .get("wireApi")
+            .and_then(|v| v.as_str())
+            .unwrap_or("responses")
+            .to_string()
+    }
+
+    pub fn extract_api_key_field(&self, app: &str) -> Option<String> {
+        if app == "claude" {
+            Some(
+                self.meta
+                    .get("apiKeyField")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ANTHROPIC_AUTH_TOKEN")
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+}
+
 /// 单个工具（claude / codex / grok）的数据。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(rename_all = "camelCase")]

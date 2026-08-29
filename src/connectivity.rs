@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 连通性与延迟测试。
 use serde::{Deserialize, Serialize};
 

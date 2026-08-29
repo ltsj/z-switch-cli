@@ -4,8 +4,7 @@ use serde_json::Value;
 
 use crate::claude_desktop;
 use crate::claude_ext;
-use crate::config;
-use crate::connectivity;
+use crate::daemon;
 use crate::live;
 use crate::official;
 use crate::original;
@@ -45,10 +44,7 @@ impl SwitchService {
             .unwrap_or(false);
         if snapshot_ready && !initial_import_done {
             if !root.has_non_official_provider() {
-                let touched = import_live_in_place(&mut root);
-                if touched {
-                    root_changed = true;
-                }
+                let _ = import_live_in_place(&mut root);
             }
             if let Some(settings) = root.settings.as_object_mut() {
                 settings.insert("initialImportDone".into(), Value::Bool(true));
@@ -81,6 +77,7 @@ impl SwitchService {
         self.root.lock().unwrap().clone()
     }
 
+    #[allow(dead_code)]
     pub fn backup_flag(&self) -> bool {
         let root = self.root.lock().unwrap();
         root.settings
@@ -116,7 +113,8 @@ impl SwitchService {
         None
     }
 
-    /// 切换供应商
+    /// 切换供应商（同步直连/代理）
+    #[allow(dead_code)]
     pub fn switch(
         &self,
         app: &str,
@@ -208,6 +206,120 @@ impl SwitchService {
         sync_claude_desktop(desktop_on, app, target_is_official, Some(&target), proxy_handle);
         store::save(&root)?;
         Ok(target)
+    }
+
+    /// 异步切换供应商（支持无缝热切与后台常驻代理守护进程）
+    pub async fn switch_async(
+        &self,
+        app: &str,
+        query: &str,
+        proxy_mode: Option<bool>,
+        port: Option<u16>,
+    ) -> Result<(Provider, bool), String> {
+        let port = port.unwrap_or(proxy::DEFAULT_PORT);
+        let daemon_alive = daemon::is_running(port).await;
+
+        let mut root = self.root.lock().unwrap();
+        let backup = root
+            .settings
+            .get("backupBeforeWrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let plugin_on = root
+            .settings
+            .get("applyClaudePlugin")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let desktop_on = root
+            .settings
+            .get("applyClaudeDesktop")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let data = root
+            .apps
+            .get_mut(app)
+            .ok_or_else(|| format!("未知应用: {app}"))?;
+
+        let (target_id, target) = {
+            let (id, p) = Self::find_provider(data, query)
+                .ok_or_else(|| format!("未找到供应商: {query}"))?;
+            (id.clone(), p.clone())
+        };
+
+        let target_is_official = store::is_official_provider(&target);
+        let current_id = data.current.clone();
+
+        let use_proxy = match proxy_mode {
+            Some(flag) => flag,
+            None => daemon_alive,
+        };
+
+        if use_proxy {
+            if target_is_official {
+                live::write_live(app, &target, backup)?;
+                if daemon_alive {
+                    let _ = daemon::send_switch(port, app, None).await;
+                }
+            } else {
+                if let Some(cur) = current_id {
+                    if cur != target_id {
+                        if let Some(old) = data.providers.get_mut(&cur) {
+                            live::backfill(app, old);
+                        }
+                    }
+                }
+
+                let runtime_target = proxy::target_from_provider(app, &target)
+                    .ok_or_else(|| format!("供应商 {} 缺少可转发的 Base URL", target.name))?;
+
+                if !daemon_alive {
+                    daemon::start_background(port).await?;
+                }
+
+                daemon::send_switch(port, app, Some(runtime_target)).await?;
+
+                let proxied = proxy::proxied_provider(app, &target, port);
+                live::write_live(app, &proxied, backup)?;
+            }
+
+            data.current = Some(target_id);
+            sync_claude_plugin(plugin_on, app, target_is_official);
+            if desktop_on && app == "claude" && claude_desktop::is_supported() {
+                if target_is_official {
+                    let _ = claude_desktop::restore_official();
+                } else {
+                    let _ = claude_desktop::apply_proxy(&proxy::local_base(port, "claude"));
+                }
+            }
+            store::save(&root)?;
+            return Ok((target, true));
+        }
+
+        // 直连模式
+        if daemon_alive {
+            let _ = daemon::send_switch(port, app, None).await;
+        }
+
+        if let Some(cur) = data.current.clone() {
+            if cur != target_id {
+                if let Some(old) = data.providers.get_mut(&cur) {
+                    live::backfill(app, old);
+                }
+            }
+        }
+        live::write_live(app, &target, backup)?;
+        data.current = Some(target_id);
+        sync_claude_plugin(plugin_on, app, target_is_official);
+        if desktop_on && app == "claude" && claude_desktop::is_supported() {
+            if target_is_official {
+                let _ = claude_desktop::restore_official();
+            } else {
+                let _ = claude_desktop::apply_direct(&target);
+            }
+        }
+        store::save(&root)?;
+        Ok((target, false))
     }
 
     /// 新增或保存供应商
@@ -417,6 +529,7 @@ fn sync_claude_plugin(plugin_on: bool, app: &str, target_is_official: bool) {
     }
 }
 
+#[allow(dead_code)]
 fn sync_claude_desktop(
     desktop_on: bool,
     app: &str,

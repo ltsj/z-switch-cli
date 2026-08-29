@@ -1,4 +1,4 @@
-//! 可选热切换代理。
+//! 本地轻量高性能反向代理服务与 Admin 控制面。
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -8,16 +8,19 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
-    response::Response,
-    routing::any,
+    response::{Json, Response},
+    routing::{any, get, post},
     Router,
 };
 use futures_util::StreamExt;
-use tokio::sync::oneshot;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::proxy_log;
 
 pub const DEFAULT_PORT: u16 = 8899;
+pub const PROXY_APPS: &[&str] = &["claude", "codex", "grok"];
+pub const PLACEHOLDER_KEY: &str = "z-switch-proxy";
 
 #[derive(Clone, Debug)]
 pub struct ProxyRuntimeConfig {
@@ -112,7 +115,7 @@ impl ProxyRuntimeConfig {
     }
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct AppTarget {
     pub base_url: String,
     pub headers: Vec<(String, String)>,
@@ -159,8 +162,6 @@ impl AppCounters {
     }
 }
 
-pub const PROXY_APPS: &[&str] = &["claude", "codex"];
-
 #[derive(Clone)]
 pub struct ProxyHandle {
     pub targets: SharedTargets,
@@ -186,6 +187,7 @@ impl Default for ProxyHandle {
     }
 }
 
+#[allow(dead_code)]
 impl ProxyHandle {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
@@ -224,6 +226,8 @@ struct Runtime {
     config: ProxyRuntimeConfig,
     error_log_lock: tokio::sync::Mutex<()>,
     counters: HashMap<String, AppCounters>,
+    port: u16,
+    shutdown_sender: mpsc::Sender<()>,
 }
 
 struct InFlightGuard(Option<Arc<AtomicU32>>);
@@ -242,6 +246,47 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+// ---------------- Admin DTO ----------------
+
+#[derive(Serialize, Deserialize)]
+pub struct AdminHealthResponse {
+    pub status: String,
+    pub port: u16,
+    pub pid: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AdminStatusResponse {
+    pub running: bool,
+    pub port: u16,
+    pub pid: u32,
+    pub routed_apps: Vec<String>,
+    pub targets: HashMap<String, String>, // app -> base_url
+    pub counters: HashMap<String, AppCounterDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AppCounterDto {
+    pub in_flight: u32,
+    pub total: u64,
+    pub last_activity_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AdminSwitchRequest {
+    pub app: String,
+    pub target: Option<AppTarget>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AdminSwitchResponse {
+    pub ok: bool,
+    pub app: String,
+    pub base_url: Option<String>,
+}
+
+// ---------------- Proxy Control ----------------
 
 pub struct ProxyControl {
     pub handle: ProxyHandle,
@@ -271,15 +316,24 @@ impl ProxyControl {
             .map_err(|e| format!("构建代理 HTTP 客户端失败: {e}"))?;
 
         self.handle.reset_counters();
+        let (admin_shutdown_tx, mut admin_shutdown_rx) = mpsc::channel::<()>(1);
         let runtime = Arc::new(Runtime {
             client,
             targets: self.handle.targets.clone(),
             config,
             error_log_lock: tokio::sync::Mutex::new(()),
             counters: self.handle.counters.clone(),
+            port,
+            shutdown_sender: admin_shutdown_tx,
         });
 
         let app = Router::new()
+            // Admin 控制面端点 (仅限本地管理)
+            .route("/_admin/health", get(admin_health))
+            .route("/_admin/status", get(admin_status))
+            .route("/_admin/switch", post(admin_switch))
+            .route("/_admin/shutdown", post(admin_shutdown))
+            // Data 面代理转发路由
             .route("/{app}/{*rest}", any(forward))
             .route("/{app}", any(forward))
             .with_state(runtime);
@@ -292,7 +346,10 @@ impl ProxyControl {
         let running = self.handle.running.clone();
         tokio::spawn(async move {
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-                let _ = rx.await;
+                tokio::select! {
+                    _ = rx => {},
+                    _ = admin_shutdown_rx.recv() => {},
+                }
             });
             if let Err(e) = server.await {
                 eprintln!("[z-switch] 代理服务退出: {e}");
@@ -309,6 +366,80 @@ impl ProxyControl {
         self.handle.running.store(false, Ordering::SeqCst);
     }
 }
+
+// ---------------- Admin Handlers ----------------
+
+async fn admin_health(State(rt): State<Arc<Runtime>>) -> Json<AdminHealthResponse> {
+    Json(AdminHealthResponse {
+        status: "ok".into(),
+        port: rt.port,
+        pid: std::process::id(),
+    })
+}
+
+async fn admin_status(State(rt): State<Arc<Runtime>>) -> Json<AdminStatusResponse> {
+    let mut targets = HashMap::new();
+    let mut routed_apps = Vec::new();
+    if let Ok(guard) = rt.targets.read() {
+        for (app, target) in &guard.map {
+            targets.insert(app.clone(), target.base_url.clone());
+            routed_apps.push(app.clone());
+        }
+    }
+    let mut counters = HashMap::new();
+    for (app, c) in &rt.counters {
+        counters.insert(
+            app.clone(),
+            AppCounterDto {
+                in_flight: c.in_flight(),
+                total: c.total(),
+                last_activity_ms: c.last_activity_ms(),
+            },
+        );
+    }
+    Json(AdminStatusResponse {
+        running: true,
+        port: rt.port,
+        pid: std::process::id(),
+        routed_apps,
+        targets,
+        counters,
+    })
+}
+
+async fn admin_switch(
+    State(rt): State<Arc<Runtime>>,
+    Json(payload): Json<AdminSwitchRequest>,
+) -> Result<Json<AdminSwitchResponse>, StatusCode> {
+    let app = payload.app.to_lowercase();
+    let base_url = if let Some(target) = payload.target {
+        let b = target.base_url.clone();
+        set_target(&rt.targets, &app, target);
+        Some(b)
+    } else {
+        clear_target(&rt.targets, &app);
+        None
+    };
+    Ok(Json(AdminSwitchResponse {
+        ok: true,
+        app,
+        base_url,
+    }))
+}
+
+async fn admin_shutdown(State(rt): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let sender = rt.shutdown_sender.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = sender.send(()).await;
+    });
+    Json(serde_json::json!({
+        "ok": true,
+        "message": "z-switch 后台代理正在安全退出"
+    }))
+}
+
+// ---------------- Forward Handler ----------------
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -710,11 +841,34 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
                 headers,
             })
         }
+        "grok" => {
+            let cfg = provider.settings_config.get("config")?.as_str()?;
+            let base = cfg
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("models_base_url"))
+                .and_then(|r| r.split('"').nth(1))
+                .map(|s| s.trim().to_string())?;
+            if base.is_empty() {
+                return None;
+            }
+            let key = provider
+                .settings_config
+                .get("auth")
+                .and_then(|a| a.get("GROK_API_KEY").or_else(|| a.get("XAI_API_KEY")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mut headers = Vec::new();
+            if !key.is_empty() {
+                headers.push(("authorization".to_string(), format!("Bearer {key}")));
+            }
+            Some(AppTarget {
+                base_url: base,
+                headers,
+            })
+        }
         _ => None,
     }
 }
-
-pub const PLACEHOLDER_KEY: &str = "z-switch-proxy";
 
 pub fn set_target(targets: &SharedTargets, app: &str, target: AppTarget) {
     if let Ok(mut g) = targets.write() {
@@ -791,6 +945,24 @@ pub fn proxied_provider(
                     "OPENAI_API_KEY".into(),
                     serde_json::Value::String(PLACEHOLDER_KEY.to_string()),
                 );
+            }
+        }
+        "grok" => {
+            if let Some(cfg) = p.settings_config.get("config").and_then(|v| v.as_str()) {
+                let rewritten: String = cfg
+                    .lines()
+                    .map(|line| {
+                        if line.trim().starts_with("models_base_url") {
+                            format!("models_base_url = \"{local}\"")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if let Some(o) = p.settings_config.as_object_mut() {
+                    o.insert("config".into(), serde_json::Value::String(rewritten));
+                }
             }
         }
         _ => {}

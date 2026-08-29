@@ -205,3 +205,54 @@ fn scan_json(path: &Path) -> Result<Vec<CcswitchProvider>, String> {
     }
     Ok(out)
 }
+
+pub fn import_from_sqlite_path(
+    service: &crate::service::SwitchService,
+    path: &Path,
+) -> Result<usize, String> {
+    let providers = scan_sqlite(path)?;
+    import_ccswitch_providers(service, providers)
+}
+
+pub fn import_from_json_path(
+    service: &crate::service::SwitchService,
+    path: &Path,
+) -> Result<usize, String> {
+    let providers = scan_json(path)?;
+    import_ccswitch_providers(service, providers)
+}
+
+pub fn import_auto(service: &crate::service::SwitchService) -> Result<usize, String> {
+    let scan_res = scan()?;
+    if scan_res.providers.is_empty() {
+        return Err("未在 ~/.cc-switch 找到可导入的有效供应商".into());
+    }
+    import_ccswitch_providers(service, scan_res.providers)
+}
+
+fn import_ccswitch_providers(
+    service: &crate::service::SwitchService,
+    list: Vec<CcswitchProvider>,
+) -> Result<usize, String> {
+    let mut count = 0;
+    for item in list {
+        let base_id = item
+            .name
+            .to_lowercase()
+            .replace(|c: char| !c.is_alphanumeric(), "-");
+        let id = format!("cc-{base_id}");
+        let provider = crate::store::Provider {
+            id,
+            name: item.name,
+            category: Some("imported".into()),
+            settings_config: item.settings_config,
+            meta: item.meta,
+            failover: serde_json::json!({ "enabled": false }),
+        };
+        if service.save_provider(&item.app, provider).is_ok() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+

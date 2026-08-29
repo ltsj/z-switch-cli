@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 拉取供应商可用模型列表（OpenAI 兼容 GET /v1/models）。
 use serde::Deserialize;
 

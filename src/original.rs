@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 首次运行时保存 Claude/Codex/Grok 原始配置，并提供可重复的一键恢复。
 use serde::{Deserialize, Serialize};
 use std::fs;
