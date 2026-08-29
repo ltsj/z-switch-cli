@@ -1,6 +1,6 @@
 [package]
 name = "z-switch-cli"
-version = "0.3.0"
+version = "0.3.1"
 description = "z-switch-cli · Claude Code / Codex / Grok 供应商一键切换命令行工具"
 authors = ["ztest.ai", "Colorful"]
 edition = "2021"
