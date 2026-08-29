@@ -322,6 +322,52 @@ impl SwitchService {
         Ok((target, false))
     }
 
+    /// 新增或保存供应商 (异步，支持热更代理)
+    pub async fn save_provider_async(
+        &self,
+        app: &str,
+        provider: Provider,
+        port: Option<u16>,
+    ) -> Result<Provider, String> {
+        let port = port.unwrap_or(proxy::DEFAULT_PORT);
+        let daemon_alive = daemon::is_running(port).await;
+
+        let mut root = self.root.lock().unwrap();
+        let backup = root
+            .settings
+            .get("backupBeforeWrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let id = provider.id.clone();
+        if id.trim().is_empty() {
+            return Err("供应商 ID 不能为空".into());
+        }
+        if store::official_provider_id(app) == Some(id.as_str()) {
+            return Err("官方账号是系统卡片，不能覆盖修改".into());
+        }
+        let data = root.apps.entry(app.to_string()).or_default();
+        if !data.order.contains(&id) {
+            data.order.push(id.clone());
+        }
+        let is_current = data.current.as_deref() == Some(id.as_str());
+        data.providers.insert(id.clone(), provider.clone());
+        if is_current {
+            if daemon_alive {
+                if let Some(target) = proxy::target_from_provider(app, &provider) {
+                    let _ = daemon::send_switch(port, app, Some(target)).await;
+                    let proxied = proxy::proxied_provider(app, &provider, port);
+                    live::write_live(app, &proxied, backup)?;
+                } else {
+                    live::write_live(app, &provider, backup)?;
+                }
+            } else {
+                live::write_live(app, &provider, backup)?;
+            }
+        }
+        store::save(&root)?;
+        Ok(provider)
+    }
+
     /// 新增或保存供应商
     pub fn save_provider(&self, app: &str, provider: Provider) -> Result<Provider, String> {
         let mut root = self.root.lock().unwrap();
@@ -384,7 +430,11 @@ impl SwitchService {
                     return Err("该供应商当前正在使用中，请指定处理方式 (--mode keep 或 --mode restore)".into());
                 }
             }
-            data.current = None;
+            if let Some(official_id) = store::official_provider_id(app) {
+                data.current = Some(official_id.to_string());
+            } else {
+                data.current = None;
+            }
         }
 
         data.providers.remove(&target_id);

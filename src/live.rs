@@ -350,6 +350,18 @@ pub fn backfill(app: &str, provider: &mut Provider) {
     match app {
         "claude" => {
             if let Some(env) = read_claude_live_env() {
+                if !official {
+                    if let Some(base) = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str) {
+                        if crate::repair::is_localhost(base) {
+                            return;
+                        }
+                    }
+                    if let Some(key) = env.get("ANTHROPIC_AUTH_TOKEN").or_else(|| env.get("ANTHROPIC_API_KEY")).and_then(Value::as_str) {
+                        if key == crate::proxy::PLACEHOLDER_KEY {
+                            return;
+                        }
+                    }
+                }
                 obj.insert(
                     "env".into(),
                     if official {
@@ -367,12 +379,29 @@ pub fn backfill(app: &str, provider: &mut Provider) {
                     eprintln!("[z-switch] 保存 Codex 官方登录态失败：{error}");
                 }
                 obj.insert("auth".into(), serde_json::json!({}));
-            } else if let Some(auth) = auth {
-                let key = auth
-                    .get("OPENAI_API_KEY")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()));
-                obj.insert("auth".into(), serde_json::json!({ "OPENAI_API_KEY": key }));
+            } else {
+                if let Some(auth_val) = &auth {
+                    if let Some(key) = auth_val.get("OPENAI_API_KEY").and_then(Value::as_str) {
+                        if key == crate::proxy::PLACEHOLDER_KEY {
+                            return;
+                        }
+                    }
+                }
+                if let Some(cfg_val) = &cfg {
+                    if cfg_val.lines().any(|l| {
+                        let (k, v) = l.trim().split_once('=').unwrap_or(("", ""));
+                        k.trim() == "base_url" && crate::repair::is_localhost(v.trim().trim_matches(['\"', '\'']))
+                    }) {
+                        return;
+                    }
+                }
+                if let Some(auth) = auth {
+                    let key = auth
+                        .get("OPENAI_API_KEY")
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
+                    obj.insert("auth".into(), serde_json::json!({ "OPENAI_API_KEY": key }));
+                }
             }
             if let Some(cfg) = cfg {
                 obj.insert(
@@ -387,6 +416,13 @@ pub fn backfill(app: &str, provider: &mut Provider) {
         }
         "grok" => {
             if let Some(cfg) = read_grok_live() {
+                if cfg.lines().any(|l| {
+                    let (k, v) = l.trim().split_once('=').unwrap_or(("", ""));
+                    (k.trim() == "base_url" || k.trim() == "models_base_url")
+                        && crate::repair::is_localhost(v.trim().trim_matches(['\"', '\'']))
+                }) {
+                    return;
+                }
                 obj.insert("config".into(), Value::String(cfg));
             }
         }
@@ -409,7 +445,7 @@ pub fn import_claude() -> Option<Provider> {
     let env_obj = env.as_object()?;
     let base = env_obj.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str());
     let base = base?;
-    if base.trim().is_empty() {
+    if base.trim().is_empty() || crate::repair::is_localhost(base) {
         return None;
     }
     let key_field = if env_obj.contains_key("ANTHROPIC_API_KEY") {
@@ -417,6 +453,11 @@ pub fn import_claude() -> Option<Provider> {
     } else {
         "ANTHROPIC_AUTH_TOKEN"
     };
+    if let Some(k) = env_obj.get(key_field).and_then(|v| v.as_str()) {
+        if k == crate::proxy::PLACEHOLDER_KEY {
+            return None;
+        }
+    }
     let name = host_of(base).unwrap_or_else(|| "导入的 Claude 供应商".to_string());
     Some(Provider {
         id: "imported-current".to_string(),
@@ -442,7 +483,14 @@ pub fn import_codex() -> Option<Provider> {
             None
         }
     });
-    let base = base.filter(|value| !value.trim().is_empty())?;
+    let base = base.filter(|value| !value.trim().is_empty() && !crate::repair::is_localhost(value))?;
+    if let Some(auth_val) = &auth {
+        if let Some(key) = auth_val.get("OPENAI_API_KEY").and_then(Value::as_str) {
+            if key == crate::proxy::PLACEHOLDER_KEY {
+                return None;
+            }
+        }
+    }
     let wire = cfg
         .lines()
         .find_map(|l| {
@@ -486,7 +534,7 @@ pub fn import_grok() -> Option<Provider> {
             None
         }
     });
-    let base = base.filter(|value| !value.trim().is_empty())?;
+    let base = base.filter(|value| !value.trim().is_empty() && !crate::repair::is_localhost(value))?;
     let name = host_of(&base).unwrap_or_else(|| "导入的 Grok 供应商".to_string());
     Some(Provider {
         id: "imported-current".to_string(),

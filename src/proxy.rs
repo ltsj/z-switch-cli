@@ -547,12 +547,7 @@ async fn forward(
         ));
     }
 
-    let base = target.base_url.trim_end_matches('/');
-    let mut url = format!("{base}{rest}");
-    if let Some(q) = uri.query() {
-        url.push('?');
-        url.push_str(q);
-    }
+    let url = build_target_url(&target.base_url, &rest, uri.query());
 
     let body_limit = rt.config.request_body_limit_bytes;
     if headers
@@ -862,7 +857,19 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
                 .get("auth")
                 .and_then(|a| a.get("GROK_API_KEY").or_else(|| a.get("XAI_API_KEY")))
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    cfg.lines().find_map(|l| {
+                        let (k, v) = l.trim().split_once('=')?;
+                        let k_trim = k.trim();
+                        if k_trim == "api_key" || k_trim == "grok_api_key" || k_trim == "xai_api_key" {
+                            Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_default();
             let mut headers = Vec::new();
             if !key.is_empty() {
                 headers.push(("authorization".to_string(), format!("Bearer {key}")));
@@ -958,8 +965,15 @@ pub fn proxied_provider(
                 let rewritten: String = cfg
                     .lines()
                     .map(|line| {
-                        if line.trim().starts_with("models_base_url") {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("models_base_url") {
                             format!("models_base_url = \"{local}\"")
+                        } else if trimmed.starts_with("base_url") {
+                            format!("base_url = \"{local}\"")
+                        } else if trimmed.starts_with("api_key") {
+                            format!("api_key = \"{PLACEHOLDER_KEY}\"")
+                        } else if trimmed.starts_with("grok_api_key") {
+                            format!("grok_api_key = \"{PLACEHOLDER_KEY}\"")
                         } else {
                             line.to_string()
                         }
@@ -970,8 +984,98 @@ pub fn proxied_provider(
                     o.insert("config".into(), serde_json::Value::String(rewritten));
                 }
             }
+            if let Some(auth) = p
+                .settings_config
+                .get_mut("auth")
+                .and_then(|v| v.as_object_mut())
+            {
+                auth.insert(
+                    "GROK_API_KEY".into(),
+                    serde_json::Value::String(PLACEHOLDER_KEY.to_string()),
+                );
+            }
         }
         _ => {}
     }
     p
 }
+
+pub fn build_target_url(base_url: &str, rest: &str, query: Option<&str>) -> String {
+    let mut base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") && (rest.starts_with("/v1/") || rest == "/v1") {
+        base = base.strip_suffix("/v1").unwrap_or(base);
+    }
+    let mut url = format!("{base}{rest}");
+    if let Some(q) = query {
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(q);
+        }
+    }
+    url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Provider;
+
+    #[test]
+    fn test_build_target_url_normalization() {
+        // Base with /v1, rest with /v1/messages -> should NOT double /v1
+        assert_eq!(
+            build_target_url("https://api.openai.com/v1", "/v1/chat/completions", None),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_target_url("https://api.openai.com/v1/", "/v1/chat/completions", None),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Base without /v1, rest with /v1/messages
+        assert_eq!(
+            build_target_url("https://api.openai.com", "/v1/chat/completions", None),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Query param support
+        assert_eq!(
+            build_target_url("https://api.anthropic.com", "/v1/messages", Some("beta=true")),
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+    }
+
+    #[test]
+    fn test_target_from_provider_and_proxied_provider() {
+        let p = Provider {
+            id: "test-claude".into(),
+            name: "Test Claude".into(),
+            category: Some("custom".into()),
+            settings_config: serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-ant-test"
+                }
+            }),
+            meta: serde_json::json!({ "apiKeyField": "ANTHROPIC_AUTH_TOKEN" }),
+            failover: serde_json::json!({ "enabled": false }),
+        };
+
+        let target = target_from_provider("claude", &p).unwrap();
+        assert_eq!(target.base_url, "https://api.anthropic.com");
+        assert_eq!(
+            target.headers,
+            vec![("authorization".to_string(), "Bearer sk-ant-test".to_string())]
+        );
+
+        let proxied = proxied_provider("claude", &p, 8999);
+        let env = proxied.settings_config.get("env").unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap().as_str().unwrap(),
+            "http://127.0.0.1:8999/claude"
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").unwrap().as_str().unwrap(),
+            PLACEHOLDER_KEY
+        );
+    }
+}
+

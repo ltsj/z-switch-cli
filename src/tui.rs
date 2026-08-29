@@ -604,7 +604,7 @@ pub async fn interactive_add(service: &SwitchService) {
         _ => return,
     };
 
-    match service.save_provider(&app_choice, provider) {
+    match service.save_provider_async(&app_choice, provider, None).await {
         Ok(p) => {
             println!(
                 "{} 成功添加供应商：{}",
@@ -745,7 +745,7 @@ pub async fn interactive_edit(service: &SwitchService) {
         _ => return,
     }
 
-    match service.save_provider(&app_choice, new_p) {
+    match service.save_provider_async(&app_choice, new_p, None).await {
         Ok(p) => {
             println!(
                 "{} 成功修改供应商：{}",

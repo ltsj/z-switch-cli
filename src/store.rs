@@ -130,11 +130,25 @@ impl Provider {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             "grok" => {
-                let auth = self.settings_config.get("auth")?;
-                auth.get("GROK_API_KEY")
-                    .or_else(|| auth.get("XAI_API_KEY"))
+                let auth_key = self
+                    .settings_config
+                    .get("auth")
+                    .and_then(|a| a.get("GROK_API_KEY").or_else(|| a.get("XAI_API_KEY")))
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
+                    .map(|s| s.to_string());
+                if auth_key.is_some() {
+                    return auth_key;
+                }
+                let cfg = self.settings_config.get("config").and_then(|v| v.as_str())?;
+                cfg.lines().find_map(|l| {
+                    let (k, v) = l.trim().split_once('=')?;
+                    let k_trim = k.trim();
+                    if k_trim == "api_key" || k_trim == "grok_api_key" || k_trim == "xai_api_key" {
+                        Some(v.trim().trim_matches(['\"', '\'']).to_string())
+                    } else {
+                        None
+                    }
+                })
             }
             _ => None,
         }
