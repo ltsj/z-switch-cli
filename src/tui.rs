@@ -751,7 +751,7 @@ pub async fn interactive_edit(service: &SwitchService) {
         None => return,
     };
 
-    let current_name = old_p.name.clone();
+    let current_name = store::provider_name_for_edit(&old_p.name, id_part);
     let current_url = old_p.extract_base_url(&app_choice).unwrap_or_default();
     let current_key = old_p.extract_api_key(&app_choice).unwrap_or_default();
     let current_model = old_p.extract_model(&app_choice).unwrap_or_default();
@@ -791,7 +791,7 @@ pub async fn interactive_edit(service: &SwitchService) {
     };
 
     let mut new_p = old_p.clone();
-    new_p.name = new_name;
+    new_p.name = store::provider_name_for_edit(&new_name, id_part);
 
     match app_choice.as_str() {
         "claude" => {
@@ -850,8 +850,15 @@ pub async fn interactive_edit(service: &SwitchService) {
                 .unwrap_or_else(|| {
                     store::build_codex_config(&new_p.name, &new_url, &new_model, &wire)
                 });
+            let mut auth = old_p
+                .settings_config
+                .get("auth")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            auth.insert("OPENAI_API_KEY".into(), serde_json::Value::String(new_key));
             new_p.settings_config = serde_json::json!({
-                "auth": { "OPENAI_API_KEY": new_key },
+                "auth": serde_json::Value::Object(auth),
                 "config": toml_config
             });
         }

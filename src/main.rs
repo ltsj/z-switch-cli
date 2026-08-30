@@ -363,8 +363,15 @@ async fn main() {
                     let mut new_p = old_p.clone();
                     new_p.id = provider_id.clone();
                     if let Some(n) = name {
-                        new_p.name = n;
+                        if n.trim().is_empty() {
+                            eprintln!("{} 供应商名称不能为空", "✖".bright_red());
+                            std::process::exit(2);
+                        }
+                        new_p.name = n.trim().to_string();
                     }
+                    // 兼容旧版 GUI JSON 编辑产生的空名称卡片。Codex
+                    // 要求 model provider 的 name 非空，编辑模型时顺手修复。
+                    new_p.name = store::provider_name_for_edit(&new_p.name, provider_id);
                     let model_was_supplied = model.is_some();
                     let target_url = url
                         .or_else(|| old_p.extract_base_url(&app_name))
@@ -421,8 +428,18 @@ async fn main() {
                                         &wire,
                                     )
                                 });
+                            let mut auth = old_p
+                                .settings_config
+                                .get("auth")
+                                .and_then(serde_json::Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            auth.insert(
+                                "OPENAI_API_KEY".into(),
+                                serde_json::Value::String(target_key),
+                            );
                             new_p.settings_config = serde_json::json!({
-                                "auth": { "OPENAI_API_KEY": target_key },
+                                "auth": serde_json::Value::Object(auth),
                                 "config": toml_config
                             });
                         }

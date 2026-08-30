@@ -339,16 +339,21 @@ fn build_codex_config_with_options(
         .filter(|value| *value > 0)
         .map(|value| format!("model_context_window = {value}\n"))
         .unwrap_or_default();
+    let provider_name = if name.trim().is_empty() {
+        "custom"
+    } else {
+        name.trim()
+    };
     format!(
-        "model_provider = \"custom\"\nmodel = {}\nmodel_reasoning_effort = {}\ndisable_response_storage = {}\n{}\n[model_providers.custom]\nname = {}\nbase_url = {}\nwire_api = {}\nrequires_openai_auth = {}\n",
+        "model_provider = \"custom\"\nmodel = {}\nmodel_reasoning_effort = {}\ndisable_response_storage = {}\n\n[model_providers.custom]\nname = {}\nbase_url = {}\nwire_api = {}\nrequires_openai_auth = {}\n{}",
         quote_toml_string(model),
         quote_toml_string(reasoning_effort),
         disable_response_storage,
-        context_window,
-        quote_toml_string(name),
+        quote_toml_string(provider_name),
         quote_toml_string(base_url),
         quote_toml_string(wire_api),
         requires_openai_auth,
+        context_window,
     )
 }
 
@@ -401,6 +406,10 @@ fn preserve_codex_config(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("custom")
         .to_string();
+    // Versions before the CLI port accidentally emitted this provider field
+    // at the document root. Move it into the selected provider while editing
+    // so an ordinary model change also repairs the old invalid shape.
+    let misplaced_context_window = root.remove("model_context_window");
     root.insert(
         "model_provider".into(),
         toml::Value::String(provider_id.clone()),
@@ -429,7 +438,20 @@ fn preserve_codex_config(
     let provider = providers
         .get_mut(&provider_id)
         .and_then(toml::Value::as_table_mut)?;
-    provider.insert("name".into(), toml::Value::String(name.to_string()));
+    if provider.get("model_context_window").is_none() {
+        if let Some(value) = misplaced_context_window {
+            provider.insert("model_context_window".into(), value);
+        }
+    }
+    let provider_name = if name.trim().is_empty() {
+        provider_id.as_str()
+    } else {
+        name.trim()
+    };
+    provider.insert(
+        "name".into(),
+        toml::Value::String(provider_name.to_string()),
+    );
     provider.insert("base_url".into(), toml::Value::String(base_url.to_string()));
     provider.insert("wire_api".into(), toml::Value::String(wire_api.to_string()));
     provider
@@ -1054,6 +1076,47 @@ impl Provider {
     }
 }
 
+/// 返回可写入编辑结果的供应商名称。
+///
+/// 旧版 GUI 的 JSON 编辑模式允许保存空名称。编辑这类历史卡片时，
+/// 使用 provider id 作为显示名可以完成自愈，同时避免生成 Codex 的
+/// `model_providers.<id>.name = ""` 无效配置。
+pub fn provider_name_for_edit(name: &str, provider_id: &str) -> String {
+    let name = name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    let provider_id = provider_id.trim();
+    if !provider_id.is_empty() {
+        return provider_id.to_string();
+    }
+    "provider".to_string()
+}
+
+/// 修复 Codex provider 表中的空显示名，同时保留其它 TOML 配置。
+///
+/// Codex 校验的是 `model_providers.<selected>.name`，而不是 shared store
+/// 外层的 `Provider.name`。因此迁移旧卡片时两处都必须保持一致。
+pub fn normalize_codex_provider_config_name(existing: &str, name: &str) -> Option<String> {
+    let mut document = existing.parse::<toml::Value>().ok()?;
+    let root = document.as_table_mut()?;
+    let provider_id = root
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("custom")
+        .to_string();
+    let providers = root
+        .get_mut("model_providers")
+        .and_then(toml::Value::as_table_mut)?;
+    let provider = providers
+        .get_mut(&provider_id)
+        .and_then(toml::Value::as_table_mut)?;
+    let normalized_name = provider_name_for_edit(name, &provider_id);
+    provider.insert("name".into(), toml::Value::String(normalized_name));
+    toml::to_string(&document).ok()
+}
+
 /// 单个工具（claude / codex / grok）的数据。
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -1186,11 +1249,38 @@ impl Root {
 
         // map key 是 current/order 的引用目标，provider.id 必须与它保持一致。
         // 外部导入的 JSON 若不一致，后续切换会把 current 写成悬空 ID。
-        for data in self.apps.values_mut() {
+        for (app, data) in &mut self.apps {
             for (id, provider) in &mut data.providers {
                 if provider.id != *id {
                     provider.id = id.clone();
                     changed = true;
+                }
+                // 旧版 GUI 允许保存空白显示名。Codex 会把该名称写入
+                // `model_providers.<id>.name`，空值会让整个配置拒绝加载；
+                // 启动时统一修复，也能覆盖直接 `use`/`list` 前未执行 edit 的路径。
+                let normalized_name = provider_name_for_edit(&provider.name, id);
+                if provider.name != normalized_name {
+                    provider.name = normalized_name;
+                    changed = true;
+                }
+                if app == "codex" && !is_official_provider_for_app(app, provider) {
+                    let Some(existing_config) = provider
+                        .settings_config
+                        .get("config")
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if let Some(normalized_config) =
+                        normalize_codex_provider_config_name(existing_config, &provider.name)
+                    {
+                        if normalized_config != existing_config {
+                            if let Some(settings) = provider.settings_config.as_object_mut() {
+                                settings.insert("config".into(), Value::String(normalized_config));
+                                changed = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1256,17 +1346,16 @@ impl Root {
                 let Some(root) = provider.settings_config.as_object_mut() else {
                     continue;
                 };
-                let key = root
-                    .get("auth")
-                    .and_then(Value::as_object)
-                    .and_then(|auth| auth.get("OPENAI_API_KEY"))
-                    .cloned();
-                let sanitized = match key {
-                    Some(key) => json!({ "OPENAI_API_KEY": key }),
-                    None => json!({}),
+                // `auth` is extensible in the shared GUI schema. Keep the
+                // complete object and only repair a missing/non-object value;
+                // dropping unknown fields here can silently break custom
+                // auth headers or provider-specific organization fields.
+                let normalized = match root.get("auth") {
+                    Some(Value::Object(auth)) => Value::Object(auth.clone()),
+                    _ => json!({}),
                 };
-                if root.get("auth") != Some(&sanitized) {
-                    root.insert("auth".into(), sanitized);
+                if root.get("auth") != Some(&normalized) {
+                    root.insert("auth".into(), normalized);
                     changed = true;
                 }
             }
@@ -1500,6 +1589,118 @@ mod tests {
 
         assert!(root.ensure_official_providers());
         assert!(root.apps["claude"].order.iter().any(|id| id == "relay"));
+    }
+
+    #[test]
+    fn codex_normalization_preserves_extra_auth_fields() {
+        let mut root = Root::default_seeded();
+        root.apps.get_mut("codex").unwrap().providers.insert(
+            "relay".into(),
+            Provider {
+                id: "relay".into(),
+                name: "Relay".into(),
+                category: Some("custom".into()),
+                settings_config: json!({
+                    "auth": {
+                        "OPENAI_API_KEY": "relay-key",
+                        "organization_id": "org-example",
+                        "custom_auth_header": "keep-me"
+                    },
+                    "config": ""
+                }),
+                meta: json!({}),
+                failover: json!({}),
+            },
+        );
+
+        assert!(root.ensure_official_providers());
+        let auth = &root.apps["codex"].providers["relay"].settings_config["auth"];
+        assert_eq!(auth["OPENAI_API_KEY"], "relay-key");
+        assert_eq!(auth["organization_id"], "org-example");
+        assert_eq!(auth["custom_auth_header"], "keep-me");
+    }
+
+    #[test]
+    fn codex_builder_places_context_window_inside_provider_table() {
+        let config = build_codex_config_with_options(
+            "Relay",
+            "https://relay.example",
+            "relay-model",
+            "responses",
+            "high",
+            true,
+            false,
+            Some(128000),
+        );
+        let parsed = config.parse::<toml::Value>().unwrap();
+        assert!(parsed.get("model_context_window").is_none());
+        assert_eq!(
+            parsed["model_providers"]["custom"]["model_context_window"].as_integer(),
+            Some(128000)
+        );
+    }
+
+    #[test]
+    fn codex_edit_migrates_legacy_root_context_window() {
+        let config = r#"model_provider = "custom"
+model = "old-model"
+model_context_window = 64000
+
+[model_providers.custom]
+name = "Relay"
+base_url = "https://relay.example"
+wire_api = "responses"
+"#;
+        let edited = build_codex_config_preserving(
+            config,
+            "Relay",
+            "https://relay.example",
+            "new-model",
+            "responses",
+        );
+        let parsed = edited.parse::<toml::Value>().unwrap();
+        assert!(parsed.get("model_context_window").is_none());
+        assert_eq!(
+            parsed["model_providers"]["custom"]["model_context_window"].as_integer(),
+            Some(64000)
+        );
+    }
+
+    #[test]
+    fn edit_name_falls_back_to_provider_id() {
+        assert_eq!(provider_name_for_edit("  ", "cpa"), "cpa");
+        assert_eq!(provider_name_for_edit(" Relay ", "cpa"), "Relay");
+        assert_eq!(provider_name_for_edit("", ""), "provider");
+    }
+
+    #[test]
+    fn normalization_repairs_empty_provider_name() {
+        let mut root = Root::default_seeded();
+        root.apps.get_mut("codex").unwrap().providers.insert(
+            "cpa".into(),
+            Provider {
+                id: "wrong-id".into(),
+                name: "  ".into(),
+                category: Some("custom".into()),
+                settings_config: json!({
+                    "auth": { "OPENAI_API_KEY": "relay-key" },
+                    "config": "model_provider = \"custom\"\nmodel = \"old\"\n\n[model_providers.custom]\nname = \"\"\nbase_url = \"https://relay.example\"\nwire_api = \"responses\"\n"
+                }),
+                meta: json!({}),
+                failover: json!({}),
+            },
+        );
+
+        assert!(root.ensure_official_providers());
+        let provider = &root.apps["codex"].providers["cpa"];
+        assert_eq!(provider.id, "cpa");
+        assert_eq!(provider.name, "cpa");
+        let config = provider.settings_config["config"].as_str().unwrap();
+        let parsed = config.parse::<toml::Value>().unwrap();
+        assert_eq!(
+            parsed["model_providers"]["custom"]["name"].as_str(),
+            Some("cpa")
+        );
     }
 
     #[test]
