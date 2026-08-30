@@ -79,6 +79,20 @@ pub fn capture_once() -> Result<bool, String> {
         return Ok(false);
     }
 
+    // CLI 可能晚于 GUI 首次启动。若此时客户端正被任一本地代理接管，
+    // 直接保存会把 localhost 和占位 Key 误当成“原始配置”，后续 restore
+    // 就会恢复出不可用的配置。延迟到代理解除后再建立全局快照。
+    let snapshots = [
+        ("claude", crate::repair::read_claude()),
+        ("codex", crate::repair::read_codex()),
+        ("grok", crate::repair::read_grok()),
+    ];
+    if snapshots.iter().any(|(app, snapshot)| {
+        crate::live::proxy_port(app).is_some() || snapshot.key_is_placeholder
+    }) {
+        return Err("当前客户端仍处于本地代理占用状态，已延迟保存原始配置快照".into());
+    }
+
     let manifest = Manifest {
         version: 1,
         captured_at: now_millis(),
@@ -101,6 +115,10 @@ pub fn capture_grok_if_missing() -> Result<(), String> {
     };
     if manifest.grok_captured {
         return Ok(());
+    }
+    let snapshot = crate::repair::read_grok();
+    if crate::live::proxy_port("grok").is_some() || snapshot.key_is_placeholder {
+        return Err("Grok 当前仍处于本地代理占用状态，已延迟保存原始配置快照".into());
     }
     manifest.grok_config_existed =
         capture_file(&config::get_grok_config_path(), "grok-config.toml")?;

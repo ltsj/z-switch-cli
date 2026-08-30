@@ -108,7 +108,7 @@ z-switch repair
 - **配置文件目录**：统一读写 `~/.z-switch/providers.json`。
 - **备份与快照池**：统一存储于 `~/.z-switch/backups/`（自动维护最近 60 份快照并安全轮转）。
 - **端口隔离**：GUI 代理默认使用 `8899`，CLI 代理默认使用 `8999`，二者同时开启互不争抢端口。
-- **写入确定性**：采用原子写入与 JSON 键排序算法，多进程与并发调用安全无冲突。
+- **写入确定性**：采用原子写入、JSON 键排序与 CLI 进程间共享锁，避免 CLI 自身并发写入半成品。GUI 端仍建议避免在 CLI 写入的同时保存同一配置，并在外部切换后刷新 GUI。
 
 ---
 
@@ -127,7 +127,8 @@ z-switch repair
 │  ~/.z-switch/           │         │         z-switch 后台守护进程           │
 │  ├── providers.json     │         │            (Daemon Process)             │
 │  ├── proxy.pid          │         │ ┌─────────────────────────────────────┐ │
-│  └── logs/proxy.log     │         │ │  Control Plane (特权管理路由)       │ │
+│  ├── logs/              │         │ │  Control Plane (本地管理路由)       │ │
+│  │   └── proxy-errors.jsonl       │ │  • /_admin/switch (内存热重载)      │ │
 └─────────────────────────┘         │ │  • /_admin/switch (内存热重载)      │ │
                                     │ │  • /_admin/status (流量/状态监控)   │ │
                                     │ └──────────────────┬──────────────────┘ │
@@ -153,7 +154,7 @@ z-switch repair
 ## 🛠️ 构建与编译
 
 ### 环境要求
-- Rust 1.75+ (edition 2021)
+- Rust 1.82+ (edition 2021)
 - Cargo
 
 ### 本地编译
@@ -163,7 +164,7 @@ cd z-switch-cli
 cargo build --release
 ```
 
-编译产物位于 `./target/release/z-switch-cli` (Windows 为 `z-switch-cli.exe`)。
+编译产物位于 `./target/release/z-switch` (Windows 为 `z-switch.exe`)。
 
 ---
 

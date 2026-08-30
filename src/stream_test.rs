@@ -79,7 +79,7 @@ impl SseParser {
 }
 
 pub fn endpoint(base_url: &str, app: &str, wire_api: &str) -> Result<String, String> {
-    let base = base_url.trim().trim_end_matches('/');
+    let base = base_url.trim();
     if base.is_empty() {
         return Err("请先填写 Base URL".into());
     }
@@ -90,14 +90,25 @@ pub fn endpoint(base_url: &str, app: &str, wire_api: &str) -> Result<String, Str
         ("codex" | "grok", _) => return Err("wire_api 只能是 chat 或 responses".into()),
         _ => return Err(format!("未知应用: {app}")),
     };
-    if base.ends_with(path) {
-        return Ok(base.to_string());
+    let mut url =
+        reqwest::Url::parse(base).map_err(|_| "Base URL 必须是合法的 http(s) 地址".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("Base URL 必须是合法的 http(s) 地址".into());
     }
-    if base.ends_with("/v1") {
-        Ok(format!("{base}{path}"))
+    let current_path = url.path().trim_end_matches('/');
+    if current_path.ends_with(path) {
+        url.set_fragment(None);
+        return Ok(url.to_string());
+    }
+    let suffix = if current_path.ends_with("/v1") {
+        path.to_string()
     } else {
-        Ok(format!("{base}/v1{path}"))
-    }
+        format!("/v1{path}")
+    };
+    let new_path = format!("{current_path}{suffix}");
+    url.set_path(&new_path);
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 fn request_body(app: &str, wire_api: &str, model: &str) -> Value {
@@ -347,4 +358,22 @@ where
         total_ms: start.elapsed().as_millis() as u64,
         streamed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint;
+
+    #[test]
+    fn endpoint_preserves_query_and_avoids_duplicate_v1() {
+        assert_eq!(
+            endpoint(
+                "https://api.example/v1?api-version=2026",
+                "codex",
+                "responses"
+            )
+            .unwrap(),
+            "https://api.example/v1/responses?api-version=2026"
+        );
+    }
 }

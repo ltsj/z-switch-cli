@@ -1,7 +1,7 @@
 //! 阶段 2：切换时写 live 配置。
 use serde_json::{Map, Value};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::store::{self, Provider};
@@ -21,7 +21,10 @@ fn read_obj(path: &Path) -> Result<Map<String, Value>, String> {
     match fs::read_to_string(path) {
         Ok(s) => {
             if s.trim().is_empty() {
-                return Ok(Map::new());
+                return Err(format!(
+                    "现有文件 {} 为空，已中止写入以防覆盖你的其它配置",
+                    path.display()
+                ));
             }
             let v: Value = serde_json::from_str(&s).map_err(|e| {
                 format!(
@@ -66,7 +69,13 @@ fn prune_old_backups(dir: &Path, keep: usize) {
     let mut files = Vec::new();
     for entry in entries.flatten() {
         if let Ok(meta) = entry.metadata() {
-            if meta.is_file() {
+            // The directory is user-visible and may contain manual notes or
+            // other files. Only remove backups created by z-switch itself.
+            let is_z_switch_backup = entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "bak");
+            if meta.is_file() && is_z_switch_backup {
                 if let Ok(time) = meta.modified() {
                     files.push((entry.path(), time));
                 }
@@ -92,6 +101,65 @@ pub fn backup_current_app(app: &str) {
         "grok" => backup_file(&config::get_grok_config_path(), "grok-config"),
         _ => {}
     }
+}
+
+#[derive(Clone)]
+struct LiveFileSnapshot {
+    path: PathBuf,
+    content: Option<Vec<u8>>,
+}
+
+/// 写入 live 配置前保存当前应用涉及的全部文件，用于 providers.json 提交
+/// 失败或后续 IPC 失败时恢复到操作前状态。
+#[derive(Clone)]
+pub struct AppLiveSnapshot {
+    files: Vec<LiveFileSnapshot>,
+}
+
+fn app_paths(app: &str) -> Result<Vec<PathBuf>, String> {
+    match app {
+        "claude" => Ok(vec![config::get_claude_settings_path()]),
+        "codex" => Ok(vec![
+            config::get_codex_auth_path(),
+            config::get_codex_config_path(),
+        ]),
+        "grok" => Ok(vec![config::get_grok_config_path()]),
+        other => Err(format!("未知应用: {other}")),
+    }
+}
+
+pub fn snapshot_app(app: &str) -> Result<AppLiveSnapshot, String> {
+    let files = app_paths(app)?
+        .into_iter()
+        .map(|path| match fs::read(&path) {
+            Ok(content) => Ok(LiveFileSnapshot {
+                path,
+                content: Some(content),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LiveFileSnapshot {
+                path,
+                content: None,
+            }),
+            Err(error) => Err(format!("读取 {} 失败: {error}", path.display())),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(AppLiveSnapshot { files })
+}
+
+pub fn restore_snapshot(snapshot: &AppLiveSnapshot) -> Result<(), String> {
+    for file in &snapshot.files {
+        match &file.content {
+            Some(content) => config::atomic_write(&file.path, content)?,
+            None => match fs::remove_file(&file.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("删除 {} 失败: {error}", file.path.display()));
+                }
+            },
+        }
+    }
+    Ok(())
 }
 
 // ---------- Claude ----------
@@ -126,19 +194,15 @@ pub fn write_official_baseline(app: &str, backup: bool) -> Result<(), String> {
             if backup {
                 backup_file(&path, "claude-settings");
             }
-            match read_obj(&path) {
-                Ok(mut settings) => {
-                    let env = settings
-                        .get("env")
-                        .cloned()
-                        .unwrap_or_else(|| Value::Object(Map::new()));
-                    settings.insert("env".into(), sanitize_claude_official_env(&env));
-                    config::write_json_file(&path, &Value::Object(settings))
-                }
-                Err(_) => {
-                    config::write_json_file(&path, &serde_json::json!({ "env": {} }))
-                }
-            }
+            // 官方恢复是显式的自愈操作：坏掉的 settings.json 已经备份，
+            // 此处应重建最小合法对象，而不是再次被损坏文件阻塞。
+            let mut settings = read_obj(&path).unwrap_or_default();
+            let env = settings
+                .get("env")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            settings.insert("env".into(), sanitize_claude_official_env(&env));
+            config::write_json_file(&path, &Value::Object(settings))
         }
         "codex" => {
             let auth = crate::official::codex_auth_for_restore()?;
@@ -195,18 +259,22 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
         (key.trim() == "model_provider").then_some(value.trim())
     }
 
-    let provider_id = config_text
-        .lines()
-        .find_map(model_provider_value)
-        .map(|value| value.trim_matches(['\"', '\'']).to_string())
+    fn model_provider_id(line: &str) -> Option<String> {
+        let value = model_provider_value(line)?;
+        crate::store::parse_toml_string_value(value)
+            .or_else(|| Some(value.trim_matches(['\"', '\'']).to_string()))
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    let provider_id = crate::store::extract_codex_provider_id(config_text)
+        .or_else(|| config_text.lines().find_map(model_provider_id))
         .filter(|value| !value.is_empty() && value != "openai");
 
     let mut result = Vec::new();
     let mut skip_provider_table = false;
     for line in config_text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let section = trimmed[1..trimmed.len() - 1].replace(['\"', '\''], "");
+        if let Some(section) = crate::store::normalized_toml_section(trimmed) {
             skip_provider_table = provider_id.as_ref().is_some_and(|id| {
                 let provider_section = format!("model_providers.{id}");
                 section == provider_section || section.starts_with(&(provider_section + "."))
@@ -235,7 +303,7 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
 }
 
 pub fn hydrate_official_provider(app: &str, provider: &mut Provider) -> bool {
-    if !store::is_official_provider(provider) {
+    if !store::is_official_provider_for_app(app, provider) {
         return false;
     }
     match app {
@@ -295,7 +363,7 @@ fn write_grok_live(config_text: &str, backup: bool) -> Result<(), String> {
 // ---------- 对外统一入口 ----------
 
 pub fn write_live(app: &str, provider: &Provider, backup: bool) -> Result<(), String> {
-    let official = store::is_official_provider(provider);
+    let official = store::is_official_provider_for_app(app, provider);
     match app {
         "claude" => {
             let mut env = provider
@@ -342,7 +410,7 @@ pub fn write_live(app: &str, provider: &Provider, backup: bool) -> Result<(), St
 }
 
 pub fn backfill(app: &str, provider: &mut Provider) {
-    let official = store::is_official_provider(provider);
+    let official = store::is_official_provider_for_app(app, provider);
     let obj = match provider.settings_config.as_object_mut() {
         Some(o) => o,
         None => return,
@@ -351,15 +419,15 @@ pub fn backfill(app: &str, provider: &mut Provider) {
         "claude" => {
             if let Some(env) = read_claude_live_env() {
                 if !official {
-                    if let Some(base) = env.get("ANTHROPIC_BASE_URL").and_then(Value::as_str) {
-                        if crate::repair::is_localhost(base) {
-                            return;
-                        }
+                    if proxy_port("claude").is_some() {
+                        return;
                     }
-                    if let Some(key) = env.get("ANTHROPIC_AUTH_TOKEN").or_else(|| env.get("ANTHROPIC_API_KEY")).and_then(Value::as_str) {
-                        if key == crate::proxy::PLACEHOLDER_KEY {
-                            return;
-                        }
+                    if ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+                        .iter()
+                        .filter_map(|field| env.get(*field).and_then(Value::as_str))
+                        .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+                    {
+                        return;
                     }
                 }
                 obj.insert(
@@ -375,8 +443,15 @@ pub fn backfill(app: &str, provider: &mut Provider) {
         "codex" => {
             let (auth, cfg) = read_codex_live();
             if official {
-                if let Err(error) = crate::official::capture_codex_current() {
-                    eprintln!("[z-switch] 保存 Codex 官方登录态失败：{error}");
+                let auth_is_placeholder = auth
+                    .as_ref()
+                    .and_then(|value| value.get("OPENAI_API_KEY"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| key == crate::proxy::PLACEHOLDER_KEY);
+                if !auth_is_placeholder && proxy_port("codex").is_none() {
+                    if let Err(error) = crate::official::capture_codex_current() {
+                        eprintln!("[z-switch] 保存 Codex 官方登录态失败：{error}");
+                    }
                 }
                 obj.insert("auth".into(), serde_json::json!({}));
             } else {
@@ -387,13 +462,8 @@ pub fn backfill(app: &str, provider: &mut Provider) {
                         }
                     }
                 }
-                if let Some(cfg_val) = &cfg {
-                    if cfg_val.lines().any(|l| {
-                        let (k, v) = l.trim().split_once('=').unwrap_or(("", ""));
-                        k.trim() == "base_url" && crate::repair::is_localhost(v.trim().trim_matches(['\"', '\'']))
-                    }) {
-                        return;
-                    }
+                if proxy_port("codex").is_some() {
+                    return;
                 }
                 if let Some(auth) = auth {
                     let key = auth
@@ -416,11 +486,17 @@ pub fn backfill(app: &str, provider: &mut Provider) {
         }
         "grok" => {
             if let Some(cfg) = read_grok_live() {
-                if cfg.lines().any(|l| {
-                    let (k, v) = l.trim().split_once('=').unwrap_or(("", ""));
-                    (k.trim() == "base_url" || k.trim() == "models_base_url")
-                        && crate::repair::is_localhost(v.trim().trim_matches(['\"', '\'']))
-                }) {
+                if proxy_port("grok").is_some() {
+                    return;
+                }
+                if ["api_key", "grok_api_key", "xai_api_key"]
+                    .iter()
+                    .filter_map(|key| {
+                        crate::store::extract_grok_endpoint_string(&cfg, key)
+                            .or_else(|| crate::store::extract_grok_model_string(&cfg, key))
+                    })
+                    .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+                {
                     return;
                 }
                 obj.insert("config".into(), Value::String(cfg));
@@ -431,13 +507,56 @@ pub fn backfill(app: &str, provider: &mut Provider) {
 }
 
 fn host_of(url: &str) -> Option<String> {
-    let s = url.split("://").last()?;
-    let host = s.split('/').next()?.trim();
-    if host.is_empty() {
-        None
+    reqwest::Url::parse(url.trim())
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+}
+
+fn claude_key_field(env: &Map<String, Value>) -> &'static str {
+    if env
+        .get("ANTHROPIC_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        "ANTHROPIC_API_KEY"
     } else {
-        Some(host.to_string())
+        "ANTHROPIC_AUTH_TOKEN"
     }
+}
+
+/// 读取指定应用当前 live 配置指向的本地代理端口。
+/// 用于后续 edit/remove/repair 操作接管曾由自定义端口启动的代理。
+pub fn proxy_port(app: &str) -> Option<u16> {
+    let base = match app {
+        "claude" => read_claude_live_env()?
+            .get("ANTHROPIC_BASE_URL")
+            .and_then(Value::as_str)
+            .map(str::to_string)?,
+        "codex" => read_codex_live()
+            .1
+            .as_deref()
+            .and_then(|cfg| crate::store::extract_codex_provider_string(cfg, "base_url"))?,
+        "grok" => {
+            let cfg = read_grok_live()?;
+            crate::store::extract_grok_endpoint_string(&cfg, "models_base_url")
+                .or_else(|| crate::store::extract_grok_endpoint_string(&cfg, "base_url"))?
+        }
+        _ => return None,
+    };
+    proxy_port_from_base(app, &base)
+}
+
+fn proxy_port_from_base(app: &str, base: &str) -> Option<u16> {
+    let url = reqwest::Url::parse(base).ok()?;
+    if !crate::repair::is_localhost(url.as_str()) {
+        return None;
+    }
+
+    // z-switch 写入的 live 代理地址固定为
+    // `http://127.0.0.1:<port>/<app>`。仅凭 localhost 不能区分本地
+    // Ollama/LM Studio 等真实上游，否则直连本地模型会被误判为外部代理。
+    let expected_path = format!("/{app}");
+    (url.path().trim_end_matches('/') == expected_path).then(|| url.port_or_known_default())?
 }
 
 pub fn import_claude() -> Option<Provider> {
@@ -445,18 +564,19 @@ pub fn import_claude() -> Option<Provider> {
     let env_obj = env.as_object()?;
     let base = env_obj.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str());
     let base = base?;
-    if base.trim().is_empty() || crate::repair::is_localhost(base) {
+    if base.trim().is_empty()
+        || proxy_port("claude").is_some()
+        || crate::proxy::validate_base_url(base).is_err()
+    {
         return None;
     }
-    let key_field = if env_obj.contains_key("ANTHROPIC_API_KEY") {
-        "ANTHROPIC_API_KEY"
-    } else {
-        "ANTHROPIC_AUTH_TOKEN"
-    };
-    if let Some(k) = env_obj.get(key_field).and_then(|v| v.as_str()) {
-        if k == crate::proxy::PLACEHOLDER_KEY {
-            return None;
-        }
+    let key_field = claude_key_field(env_obj);
+    if ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+        .iter()
+        .filter_map(|field| env_obj.get(*field).and_then(Value::as_str))
+        .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+    {
+        return None;
     }
     let name = host_of(base).unwrap_or_else(|| "导入的 Claude 供应商".to_string());
     Some(Provider {
@@ -475,15 +595,12 @@ pub fn import_codex() -> Option<Provider> {
     if cfg.trim().is_empty() {
         return None;
     }
-    let base = cfg.lines().find_map(|l| {
-        let (k, v) = l.trim().split_once('=')?;
-        if k.trim() == "base_url" {
-            Some(v.trim().trim_matches(['\"', '\'']).to_string())
-        } else {
-            None
-        }
-    });
-    let base = base.filter(|value| !value.trim().is_empty() && !crate::repair::is_localhost(value))?;
+    let base = crate::store::extract_codex_provider_string(&cfg, "base_url");
+    let base = base.filter(|value| {
+        !value.trim().is_empty()
+            && proxy_port("codex").is_none()
+            && crate::proxy::validate_base_url(value).is_ok()
+    })?;
     if let Some(auth_val) = &auth {
         if let Some(key) = auth_val.get("OPENAI_API_KEY").and_then(Value::as_str) {
             if key == crate::proxy::PLACEHOLDER_KEY {
@@ -491,16 +608,7 @@ pub fn import_codex() -> Option<Provider> {
             }
         }
     }
-    let wire = cfg
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.trim().split_once('=')?;
-            if k.trim() == "wire_api" {
-                Some(v.trim().trim_matches(['\"', '\'']).to_string())
-            } else {
-                None
-            }
-        })
+    let wire = crate::store::extract_codex_provider_string(&cfg, "wire_api")
         .unwrap_or_else(|| "responses".to_string());
     let name = host_of(&base).unwrap_or_else(|| "导入的 Codex 供应商".to_string());
     let key = auth
@@ -526,15 +634,23 @@ pub fn import_grok() -> Option<Provider> {
     if cfg.trim().is_empty() {
         return None;
     }
-    let base = cfg.lines().find_map(|l| {
-        let (k, v) = l.trim().split_once('=')?;
-        if k.trim() == "models_base_url" || k.trim() == "base_url" {
-            Some(v.trim().trim_matches(['\"', '\'']).to_string())
-        } else {
-            None
-        }
-    });
-    let base = base.filter(|value| !value.trim().is_empty() && !crate::repair::is_localhost(value))?;
+    let base = crate::store::extract_grok_endpoint_string(&cfg, "models_base_url")
+        .or_else(|| crate::store::extract_grok_endpoint_string(&cfg, "base_url"));
+    let base = base.filter(|value| {
+        !value.trim().is_empty()
+            && proxy_port("grok").is_none()
+            && crate::proxy::validate_base_url(value).is_ok()
+    })?;
+    if ["api_key", "grok_api_key", "xai_api_key"]
+        .iter()
+        .filter_map(|key| {
+            crate::store::extract_grok_endpoint_string(&cfg, key)
+                .or_else(|| crate::store::extract_grok_model_string(&cfg, key))
+        })
+        .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+    {
+        return None;
+    }
     let name = host_of(&base).unwrap_or_else(|| "导入的 Grok 供应商".to_string());
     Some(Provider {
         id: "imported-current".to_string(),
@@ -544,4 +660,77 @@ pub fn import_grok() -> Option<Provider> {
         meta: serde_json::json!({ "imported": true }),
         failover: serde_json::json!({ "enabled": false }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_port_only_matches_z_switch_app_path() {
+        assert_eq!(
+            proxy_port_from_base("claude", "http://127.0.0.1:8999/claude"),
+            Some(8999)
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "http://127.0.0.1:8999/claude/"),
+            Some(8999)
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "http://127.0.0.1:11434/v1"),
+            None
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "https://api.example.com/claude"),
+            None
+        );
+    }
+
+    #[test]
+    fn official_codex_config_removes_commented_provider_table() {
+        let input = r#"model_provider = "custom" # selected relay
+model = "gpt-5"
+
+[model_providers.custom] # relay
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+
+[mcp_servers.docs]
+command = "docs"
+"#;
+
+        let output = sanitize_codex_official_config(input);
+        assert!(!output.contains("model_provider ="));
+        assert!(!output.contains("relay.example"));
+        assert!(output.contains("model = \"gpt-5\""));
+        assert!(output.contains("[mcp_servers.docs]"));
+    }
+
+    #[test]
+    fn pruning_backups_keeps_non_backup_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "z_switch_backup_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("first.bak"), b"1").unwrap();
+        fs::write(dir.join("second.bak"), b"2").unwrap();
+        fs::write(dir.join("manual.txt"), b"keep").unwrap();
+
+        prune_old_backups(&dir, 1);
+
+        let backups = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bak"))
+            .count();
+        assert_eq!(backups, 1);
+        assert_eq!(fs::read(dir.join("manual.txt")).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(dir);
+    }
 }

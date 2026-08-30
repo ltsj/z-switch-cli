@@ -1,5 +1,5 @@
 //! 命令行参数解析定义。
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,7 +47,7 @@ pub enum Commands {
     #[command(alias = "ls")]
     List {
         /// 仅列出指定应用的供应商
-        #[arg(value_enum)]
+        #[arg(short, long, value_enum)]
         app: Option<AppType>,
     },
 
@@ -84,7 +84,13 @@ pub enum Commands {
         app: Option<AppType>,
 
         /// 进行真实流式对话首字延时 (TTFT) 测速
-        #[arg(short, long, default_value_t = true)]
+        #[arg(
+            short,
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_name = "BOOL"
+        )]
         stream: bool,
 
         /// 测试该应用下的所有供应商
@@ -147,6 +153,10 @@ pub enum Commands {
         /// 修改默认模型
         #[arg(short, long)]
         model: Option<String>,
+
+        /// 本地代理端口（未指定时从当前 live 配置识别，默认 8999）
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// 删除供应商
@@ -162,6 +172,10 @@ pub enum Commands {
         /// 若当前供应商正在使用中的处理方式 (keep 保留配置 / restore 恢复官方基线)
         #[arg(long)]
         mode: Option<String>,
+
+        /// 本地代理端口（未指定时从当前 live 配置识别，默认 8999）
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// 本地常驻代理管理
@@ -186,8 +200,12 @@ pub enum Commands {
     /// 恢复官方基线配置
     Restore {
         /// 目标应用
-        #[arg(value_enum)]
+        #[arg(short, long, value_enum)]
         app: Option<AppType>,
+
+        /// 本地代理端口（未指定时从当前 live 配置识别，默认 8999）
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// 环境诊断与配置健康检查
@@ -196,13 +214,17 @@ pub enum Commands {
     /// 修复本地残留占位配置或环境异常
     Repair {
         /// 目标应用
-        #[arg(value_enum)]
+        #[arg(short, long, value_enum)]
         app: Option<AppType>,
+
+        /// 本地代理端口（未指定时从当前 live 配置识别，默认 8999）
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// 系统配置管理
     Config {
-        /// 配置项名称（backupBeforeWrite / applyClaudeDesktop / applyClaudePlugin）
+        /// 配置项名称（backupBeforeWrite / applyClaudeDesktop / applyClaudePlugin / skipClaudeOnboarding）
         key: Option<String>,
 
         /// 设置的值（true / false）

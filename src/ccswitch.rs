@@ -43,8 +43,31 @@ fn has_base_url(app: &str, cfg: &Value) -> bool {
         "codex" => cfg
             .get("config")
             .and_then(|v| v.as_str())
-            .map(|toml| toml.lines().any(|l| l.trim().starts_with("base_url")))
-            .unwrap_or(false),
+            .and_then(|toml| crate::store::extract_codex_provider_string(toml, "base_url"))
+            .is_some_and(|value| !value.trim().is_empty()),
+        _ => false,
+    }
+}
+
+fn has_proxy_placeholder(app: &str, cfg: &Value) -> bool {
+    match app {
+        "claude" => cfg
+            .get("env")
+            .and_then(Value::as_object)
+            .is_some_and(|env| {
+                ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+                    .iter()
+                    .any(|key| {
+                        env.get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == crate::proxy::PLACEHOLDER_KEY)
+                    })
+            }),
+        "codex" => cfg
+            .get("auth")
+            .and_then(|auth| auth.get("OPENAI_API_KEY"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == crate::proxy::PLACEHOLDER_KEY),
         _ => false,
     }
 }
@@ -92,11 +115,9 @@ fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>
 }
 
 fn scan_sqlite(db_path: &Path) -> Result<Vec<CcswitchProvider>, String> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("打开 cc-switch.db 失败: {e}"))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("打开 cc-switch.db 失败: {e}"))?;
 
     let cols = table_columns(&conn, "providers")?;
     if cols.is_empty() {
@@ -118,33 +139,49 @@ fn scan_sqlite(db_path: &Path) -> Result<Vec<CcswitchProvider>, String> {
         .map_err(|e| format!("查询 providers 失败: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
-            let app: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let settings: String = row.get(2)?;
-            let meta: Option<String> = if with_meta { row.get(3).ok() } else { None };
+            let app: Option<String> = row.get(0)?;
+            let name: Option<String> = row.get(1)?;
+            let settings: Option<String> = row.get(2)?;
+            let meta: Option<String> = if with_meta {
+                row.get(3).unwrap_or(None)
+            } else {
+                None
+            };
             Ok((app, name, settings, meta))
         })
         .map_err(|e| format!("读取 providers 失败: {e}"))?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (app, name, settings, meta) = row.map_err(|e| format!("读取 providers 行失败: {e}"))?;
+        let (app, name, settings, meta) = match row {
+            Ok(row) => row,
+            Err(error) => {
+                eprintln!("[z-switch] 跳过无法读取的 cc-switch 供应商行：{error}");
+                continue;
+            }
+        };
+        let Some(app) = app else {
+            continue;
+        };
         if !is_supported_app(&app) {
             continue;
         }
+        let Some(settings) = settings else {
+            continue;
+        };
         let Ok(settings_config) = serde_json::from_str::<Value>(&settings) else {
             continue;
         };
-        if !has_base_url(&app, &settings_config) {
+        if !has_base_url(&app, &settings_config) || has_proxy_placeholder(&app, &settings_config) {
             continue;
         }
         let meta = meta
             .and_then(|m| serde_json::from_str::<Value>(&m).ok())
             .unwrap_or_else(|| serde_json::json!({}));
-        let name = if name.trim().is_empty() {
+        let name = if name.as_deref().is_none_or(|name| name.trim().is_empty()) {
             app.clone()
         } else {
-            name
+            name.unwrap_or_default()
         };
         out.push(CcswitchProvider {
             app,
@@ -188,7 +225,10 @@ fn scan_json(path: &Path) -> Result<Vec<CcswitchProvider>, String> {
                 .or_else(|| provider.get("settings_config"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            if settings_config.is_null() || !has_base_url(app, &settings_config) {
+            if settings_config.is_null()
+                || !has_base_url(app, &settings_config)
+                || has_proxy_placeholder(app, &settings_config)
+            {
                 continue;
             }
             let meta = provider
@@ -235,7 +275,9 @@ fn import_ccswitch_providers(
     list: Vec<CcswitchProvider>,
 ) -> Result<usize, String> {
     let mut count = 0;
+    let mut failures = Vec::new();
     for item in list {
+        let name = item.name.clone();
         let base_id = item
             .name
             .to_lowercase()
@@ -249,10 +291,62 @@ fn import_ccswitch_providers(
             meta: item.meta,
             failover: serde_json::json!({ "enabled": false }),
         };
-        if service.save_provider(&item.app, provider).is_ok() {
-            count += 1;
+        match service.add_provider(&item.app, provider) {
+            Ok(_) => count += 1,
+            Err(error) => failures.push(format!("{name} ({})：{error}", item.app)),
         }
+    }
+    for failure in failures {
+        eprintln!("[z-switch] 跳过无效 cc-switch 供应商：{failure}");
+    }
+    if count == 0 {
+        return Err("找到的 cc-switch 供应商均无法导入".into());
     }
     Ok(count)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::scan_sqlite;
+    use rusqlite::params;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sqlite_nullable_provider_fields_do_not_abort_the_scan() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "z_switch_ccswitch_nullable_{}_{}.db",
+            std::process::id(),
+            suffix
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE providers (app_type TEXT, name TEXT, settings_config TEXT, meta TEXT)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO providers (app_type, name, settings_config, meta) VALUES (?1, NULL, ?2, NULL)",
+                params![
+                    "claude",
+                    r#"{"env":{"ANTHROPIC_BASE_URL":"https://relay.example"}}"#
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO providers (app_type, name, settings_config, meta) VALUES (?1, ?2, NULL, NULL)",
+                params!["codex", "missing settings"],
+            )
+            .unwrap();
+        }
+
+        let providers = scan_sqlite(&path).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "claude");
+        let _ = std::fs::remove_file(path);
+    }
+}

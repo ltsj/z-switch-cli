@@ -115,56 +115,49 @@ fn build_profile(base_url: &str, api_key: &str) -> Value {
 }
 
 fn direct_credentials(provider: &Provider) -> Result<(String, String), String> {
-    let env = provider
-        .settings_config
-        .get("env")
-        .and_then(Value::as_object)
-        .ok_or("供应商缺少 env 配置")?;
-    let base_url = env
-        .get("ANTHROPIC_BASE_URL")
-        .and_then(Value::as_str)
-        .map(str::trim)
+    let base_url = provider
+        .extract_base_url("claude")
+        .map(|value| value.trim().to_string())
         .filter(|v| !v.is_empty())
-        .ok_or("供应商缺少 ANTHROPIC_BASE_URL")?
-        .to_string();
-    let key_field = provider
-        .meta
-        .get("apiKeyField")
-        .and_then(Value::as_str)
-        .unwrap_or("ANTHROPIC_AUTH_TOKEN");
-    let api_key = env
-        .get(key_field)
-        .and_then(Value::as_str)
-        .map(str::trim)
+        .ok_or("供应商缺少 ANTHROPIC_BASE_URL")?;
+    let api_key = provider
+        .extract_api_key("claude")
+        .map(|value| value.trim().to_string())
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| format!("供应商缺少 {key_field}"))?
-        .to_string();
+        .ok_or("供应商缺少 Claude API Key")?;
     Ok((base_url, api_key))
 }
 
-fn read_obj_or_empty(path: &Path) -> Map<String, Value> {
+fn read_obj_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
     if !path.exists() {
-        return Map::new();
+        return Ok(Map::new());
     }
     match read_json_file::<Value>(path) {
-        Ok(Value::Object(map)) => map,
-        _ => Map::new(),
+        Ok(Value::Object(map)) => Ok(map),
+        Ok(Value::Null) => Err(format!("{} 不是 JSON 对象，已中止写入", path.display())),
+        Ok(_) => Err(format!("{} 不是 JSON 对象，已中止写入", path.display())),
+        Err(error) => Err(error),
     }
 }
 
 fn write_deployment_mode(path: &Path, mode: &str) -> Result<(), String> {
-    let mut obj = read_obj_or_empty(path);
+    let mut obj = read_obj_or_empty(path)?;
     obj.insert("deploymentMode".into(), Value::String(mode.into()));
     write_json_file(path, &Value::Object(obj))
 }
 
 fn write_meta(path: &Path, applied_profile_id: Option<&str>) -> Result<(), String> {
-    let mut obj = read_obj_or_empty(path);
-    let mut entries = obj
-        .get("entries")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let mut obj = read_obj_or_empty(path)?;
+    let mut entries = match obj.get("entries") {
+        None => Vec::new(),
+        Some(Value::Array(entries)) => entries.clone(),
+        Some(_) => {
+            return Err(format!(
+                "{} 的 entries 不是 JSON 数组，已中止写入",
+                path.display()
+            ))
+        }
+    };
     entries.retain(|e| e.get("id").and_then(Value::as_str) != Some(PROFILE_ID));
 
     match applied_profile_id {
@@ -201,8 +194,11 @@ fn remove_enterprise_config(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    let mut obj = read_obj_or_empty(path);
-    let Some(enterprise) = obj.get_mut("enterpriseConfig").and_then(Value::as_object_mut) else {
+    let mut obj = read_obj_or_empty(path)?;
+    let Some(enterprise) = obj
+        .get_mut("enterpriseConfig")
+        .and_then(Value::as_object_mut)
+    else {
         return Ok(());
     };
     for key in ENTERPRISE_KEYS {
@@ -282,11 +278,7 @@ fn current_paths() -> Result<Paths, String> {
     {
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                crate::config::get_home_dir()
-                    .join("AppData")
-                    .join("Local")
-            });
+            .unwrap_or_else(|| crate::config::get_home_dir().join("AppData").join("Local"));
         let normal = pick_windows_claude_dir(&local_app_data, false)
             .unwrap_or_else(|| local_app_data.join("Claude"));
         let threep = pick_windows_claude_dir(&local_app_data, true)

@@ -2,8 +2,39 @@
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+pub struct StoreLock {
+    file: fs::File,
+}
+
+impl StoreLock {
+    fn acquire() -> Result<Self, String> {
+        let path = get_store_lock_path();
+        let parent = path
+            .parent()
+            .ok_or_else(|| "无效的配置锁路径".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建配置锁目录 {} 失败: {e}", parent.display()))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("打开配置锁 {} 失败: {e}", path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|e| format!("获取配置锁 {} 失败: {e}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
 
 /// 用户主目录。测试可用 `Z_SWITCH_TEST_HOME` 覆盖。
 pub fn get_home_dir() -> PathBuf {
@@ -24,6 +55,14 @@ pub fn get_app_config_dir() -> PathBuf {
 /// providers.json 路径
 pub fn get_store_path() -> PathBuf {
     get_app_config_dir().join("providers.json")
+}
+
+pub fn get_store_lock_path() -> PathBuf {
+    get_app_config_dir().join("providers.json.lock")
+}
+
+pub fn lock_store() -> Result<StoreLock, String> {
+    StoreLock::acquire()
 }
 
 /// z-switch 管理的本机账号凭据快照目录。
@@ -88,7 +127,7 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), String> {
     atomic_write(path, data.as_bytes())
 }
 
-/// 原子写入：写临时文件（带纳秒后缀）→ rename 替换，避免半写状态。
+/// 原子写入：写临时文件（带纳秒后缀）→ 原子替换，避免半写状态。
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -107,23 +146,98 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     let tmp = parent.join(format!("{file_name}.tmp.{ts}"));
 
     {
-        let mut f = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Managed files contain API keys and are replaced through a new
+            // inode. Do not inherit an accidentally broad mode from an old
+            // providers.json/settings file.
+            options.mode(0o600);
+        }
+        let mut f = options
+            .open(&tmp)
+            .map_err(|e| format!("创建临时文件失败: {e}"))?;
         f.write_all(data)
             .map_err(|e| format!("写入临时文件失败: {e}"))?;
         f.flush().map_err(|e| format!("flush 失败: {e}"))?;
     }
 
     #[cfg(windows)]
-    {
-        if path.exists() {
-            let _ = fs::remove_file(path);
-        }
-    }
+    let result = replace_file_windows(&tmp, path);
+    #[cfg(not(windows))]
+    let result = fs::rename(&tmp, path).map_err(io::Error::from);
 
-    fs::rename(&tmp, path).map_err(|e| {
+    result.map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("原子替换失败 {} -> {}: {e}", tmp.display(), path.display())
     })
+}
+
+#[cfg(windows)]
+fn replace_file_windows(tmp: &Path, path: &Path) -> io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let tmp_wide = wide(tmp);
+    let path_wide = wide(path);
+    if path.exists() {
+        let replaced = unsafe {
+            ReplaceFileW(
+                path_wide.as_ptr(),
+                tmp_wide.as_ptr(),
+                std::ptr::null(),
+                REPLACE_FILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if replaced != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    } else {
+        let moved = unsafe {
+            MoveFileExW(
+                tmp_wide.as_ptr(),
+                path_wide.as_ptr(),
+                MOVE_FILE_WRITE_THROUGH,
+            )
+        };
+        if moved != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+const REPLACE_FILE_WRITE_THROUGH: u32 = 0x00000001;
+#[cfg(windows)]
+const MOVE_FILE_WRITE_THROUGH: u32 = 0x00000008;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn ReplaceFileW(
+        replaced_file_name: *const u16,
+        replacement_file_name: *const u16,
+        backup_file_name: *const u16,
+        replace_flags: u32,
+        exclude: *mut std::ffi::c_void,
+        reserved: *mut std::ffi::c_void,
+    ) -> i32;
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
 
 #[cfg(test)]
@@ -158,5 +272,45 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
     }
-}
 
+    #[cfg(unix)]
+    #[test]
+    fn new_atomic_files_are_private_by_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "z_switch_private_test_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let file = dir.join("credentials.json");
+        atomic_write(&file, b"secret").unwrap();
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_tightens_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "z_switch_permission_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = dir.join("credentials.json");
+        atomic_write(&file, b"old").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&file, b"new").unwrap();
+
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read(&file).unwrap(), b"new");
+        let _ = fs::remove_dir_all(dir);
+    }
+}

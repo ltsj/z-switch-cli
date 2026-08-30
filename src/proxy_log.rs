@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 //! 本地路由错误日志。
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 use crate::config;
@@ -10,6 +11,7 @@ use crate::config;
 const LOG_FILE: &str = "proxy-errors.jsonl";
 const ROTATED_FILE: &str = "proxy-errors.jsonl.1";
 const MAX_DETAIL_CHARS: usize = 16_000;
+const MAX_TAIL_ENTRIES: usize = 10_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,11 +51,11 @@ pub fn redact_and_truncate(raw: &str, secrets: &[String]) -> String {
     let mut out = raw.to_string();
     for secret in secrets {
         let secret = secret.trim();
-        if secret.len() >= 4 {
+        if !secret.is_empty() {
             out = out.replace(secret, "[REDACTED]");
         }
         if let Some(token) = secret.strip_prefix("Bearer ") {
-            if token.len() >= 4 {
+            if !token.is_empty() {
                 out = out.replace(token, "[REDACTED]");
             }
         }
@@ -84,9 +86,14 @@ pub fn append(entry: &ProxyErrorEntry<'_>, max_mb: u64) -> Result<(), String> {
         }
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&path)
         .map_err(|error| format!("打开路由错误日志 {} 失败：{error}", path.display()))?;
     file.write_all(line.as_bytes())
@@ -105,19 +112,24 @@ pub fn clear() -> Result<(), String> {
 }
 
 pub fn read_recent(tail: usize) -> Vec<serde_json::Value> {
-    let path = log_path();
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let mut entries = Vec::new();
-    for line in content.lines().rev().take(tail) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            entries.push(v);
+    let tail = tail.min(MAX_TAIL_ENTRIES);
+    let mut entries = VecDeque::with_capacity(tail);
+    if tail == 0 {
+        return Vec::new();
+    }
+    for path in [rotated_path(), log_path()] {
+        if let Ok(file) = fs::File::open(path) {
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if entries.len() == tail {
+                        entries.pop_front();
+                    }
+                    entries.push_back(value);
+                }
+            }
         }
     }
-    entries.reverse();
-    entries
+    entries.into_iter().collect()
 }
 
 pub fn interactive_view(tail: usize) {
@@ -129,7 +141,10 @@ pub fn interactive_view(tail: usize) {
     println!();
     println!("── 最近 {} 条代理错误日志 ──", entries.len());
     for item in entries {
-        let ts = item.get("timestampMs").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ts = item
+            .get("timestampMs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let app = item.get("app").and_then(|v| v.as_str()).unwrap_or("-");
         let phase = item.get("phase").and_then(|v| v.as_str()).unwrap_or("-");
         let status = item
@@ -145,4 +160,3 @@ pub fn interactive_view(tail: usize) {
     }
     println!();
 }
-

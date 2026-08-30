@@ -228,6 +228,7 @@ struct Runtime {
     counters: HashMap<String, AppCounters>,
     port: u16,
     shutdown_sender: mpsc::Sender<()>,
+    admin_token: String,
 }
 
 struct InFlightGuard(Option<Arc<AtomicU32>>);
@@ -235,7 +236,12 @@ struct InFlightGuard(Option<Arc<AtomicU32>>);
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Some(counter) = &self.0 {
-            counter.fetch_sub(1, Ordering::Relaxed);
+            // reset_counters() may run while an older response is still being
+            // streamed.  A plain fetch_sub would wrap 0 to u32::MAX in that
+            // case and make the status output invalid until the next restart.
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
         }
     }
 }
@@ -301,7 +307,15 @@ impl ProxyControl {
         }
     }
 
-    pub async fn start(&mut self, port: u16, config: ProxyRuntimeConfig) -> Result<(), String> {
+    pub async fn start(
+        &mut self,
+        port: u16,
+        config: ProxyRuntimeConfig,
+        admin_token: String,
+    ) -> Result<(), String> {
+        if port == 0 {
+            return Err("代理端口必须在 1 到 65535 之间".into());
+        }
         self.stop();
         let addr = format!("127.0.0.1:{port}");
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -325,6 +339,7 @@ impl ProxyControl {
             counters: self.handle.counters.clone(),
             port,
             shutdown_sender: admin_shutdown_tx,
+            admin_token,
         });
 
         let app = Router::new()
@@ -377,12 +392,25 @@ async fn admin_health(State(rt): State<Arc<Runtime>>) -> Json<AdminHealthRespons
     })
 }
 
-async fn admin_status(State(rt): State<Arc<Runtime>>) -> Json<AdminStatusResponse> {
+fn authorized(headers: &HeaderMap, rt: &Runtime) -> bool {
+    headers
+        .get("x-z-switch-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !rt.admin_token.is_empty() && value == rt.admin_token)
+}
+
+async fn admin_status(
+    State(rt): State<Arc<Runtime>>,
+    headers: HeaderMap,
+) -> Result<Json<AdminStatusResponse>, StatusCode> {
+    if !authorized(&headers, &rt) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let mut targets = HashMap::new();
     let mut routed_apps = Vec::new();
     if let Ok(guard) = rt.targets.read() {
         for (app, target) in &guard.map {
-            targets.insert(app.clone(), target.base_url.clone());
+            targets.insert(app.clone(), proxy_log::sanitize_url(&target.base_url));
             routed_apps.push(app.clone());
         }
     }
@@ -397,21 +425,43 @@ async fn admin_status(State(rt): State<Arc<Runtime>>) -> Json<AdminStatusRespons
             },
         );
     }
-    Json(AdminStatusResponse {
+    Ok(Json(AdminStatusResponse {
         running: true,
         port: rt.port,
         pid: std::process::id(),
         routed_apps,
         targets,
         counters,
-    })
+    }))
 }
 
 async fn admin_switch(
     State(rt): State<Arc<Runtime>>,
+    headers: HeaderMap,
     Json(payload): Json<AdminSwitchRequest>,
 ) -> Result<Json<AdminSwitchResponse>, StatusCode> {
+    if !authorized(&headers, &rt) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let app = payload.app.to_lowercase();
+    if !PROXY_APPS.contains(&app.as_str()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Some(target) = payload.target.as_ref() {
+        let parsed =
+            reqwest::Url::parse(target.base_url.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if is_self_proxy_target(&target.base_url, rt.port) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        for (name, value) in &target.headers {
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+        }
+    }
     let base_url = if let Some(target) = payload.target {
         let b = target.base_url.clone();
         set_target(&rt.targets, &app, target);
@@ -427,16 +477,22 @@ async fn admin_switch(
     }))
 }
 
-async fn admin_shutdown(State(rt): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn admin_shutdown(
+    State(rt): State<Arc<Runtime>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !authorized(&headers, &rt) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let sender = rt.shutdown_sender.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = sender.send(()).await;
     });
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "ok": true,
         "message": "z-switch 后台代理正在安全退出"
-    }))
+    })))
 }
 
 // ---------------- Forward Handler ----------------
@@ -453,6 +509,25 @@ const HOP_BY_HOP: &[&str] = &[
     "host",
     "content-length",
 ];
+
+fn hop_by_hop_headers<I>(connection_values: I) -> HashSet<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut names = HOP_BY_HOP
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    for value in connection_values {
+        for name in value.split(',') {
+            let name = name.trim().to_ascii_lowercase();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
 
 const AUTH_HEADERS: &[&str] = &["authorization", "x-api-key", "api-key"];
 const ERROR_BODY_CAPTURE_BYTES: usize = 64 * 1024;
@@ -549,6 +624,15 @@ async fn forward(
 
     let url = build_target_url(&target.base_url, &rest, uri.query());
 
+    // Provider 配置可能来自外部导入；如果它误指向当前代理端口，直接转发
+    // 会递归命中自己，最终耗尽连接或请求栈。其它本机端口仍允许作为上游。
+    if is_self_proxy_target(&url, rt.port) {
+        let detail = format!("代理目标指向自身监听地址，已阻止递归转发：{}", rt.port);
+        let secrets = target_secrets(&target);
+        write_proxy_error(&rt, &app, None, &url, "self_proxy_loop", &detail, &secrets).await;
+        return Err((StatusCode::LOOP_DETECTED, detail));
+    }
+
     let body_limit = rt.config.request_body_limit_bytes;
     if headers
         .get(axum::http::header::CONTENT_LENGTH)
@@ -584,13 +668,20 @@ async fn forward(
             .map(|hint| hint.stream)
             .unwrap_or(false);
 
+    let request_hop_by_hop = hop_by_hop_headers(
+        headers
+            .get_all("connection")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
     let mut fwd = reqwest::header::HeaderMap::new();
     for (name, value) in headers.iter() {
         let lname = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lname.as_str()) {
+        if request_hop_by_hop.contains(lname.as_str()) {
             continue;
         }
-        if AUTH_HEADERS.contains(&lname.as_str()) {
+        if AUTH_HEADERS.contains(&lname.as_str()) || lname == "x-z-switch-admin-token" {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -601,6 +692,10 @@ async fn forward(
         }
     }
     for (k, v) in &target.headers {
+        let lname = k.to_ascii_lowercase();
+        if HOP_BY_HOP.contains(&lname.as_str()) || lname == "x-z-switch-admin-token" {
+            continue;
+        }
         if let (Ok(n), Ok(val)) = (
             reqwest::header::HeaderName::from_bytes(k.as_bytes()),
             reqwest::header::HeaderValue::from_str(v),
@@ -656,9 +751,17 @@ async fn forward(
 
     let status = upstream.status();
     let mut builder = Response::builder().status(status.as_u16());
+    let response_hop_by_hop = hop_by_hop_headers(
+        upstream
+            .headers()
+            .get_all("connection")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
     for (name, value) in upstream.headers().iter() {
         let lname = name.as_str().to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lname.as_str()) {
+        if response_hop_by_hop.contains(lname.as_str()) {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -681,7 +784,13 @@ async fn forward(
     let upstream_stream = Box::pin(upstream.bytes_stream());
 
     let stream = futures_util::stream::unfold(
-        (upstream_stream, true, false, Vec::<u8>::new(), in_flight_guard),
+        (
+            upstream_stream,
+            true,
+            false,
+            Vec::<u8>::new(),
+            in_flight_guard,
+        ),
         move |(mut upstream_stream, first_chunk, finished, mut capture, guard)| {
             let rt = stream_rt.clone();
             let app = stream_app.clone();
@@ -789,7 +898,7 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
         "claude" => {
             let env = provider.settings_config.get("env")?.as_object()?;
             let base = env.get("ANTHROPIC_BASE_URL")?.as_str()?.trim().to_string();
-            if base.is_empty() {
+            if base.is_empty() || validate_base_url(&base).is_err() {
                 return None;
             }
             let key_field = provider
@@ -797,7 +906,28 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
                 .get("apiKeyField")
                 .and_then(|v| v.as_str())
                 .unwrap_or("ANTHROPIC_AUTH_TOKEN");
-            let key = env.get(key_field).and_then(|v| v.as_str()).unwrap_or("");
+            let preferred_field = if key_field == "ANTHROPIC_API_KEY" {
+                "ANTHROPIC_API_KEY"
+            } else {
+                "ANTHROPIC_AUTH_TOKEN"
+            };
+            let fallback_field = if preferred_field == "ANTHROPIC_API_KEY" {
+                "ANTHROPIC_AUTH_TOKEN"
+            } else {
+                "ANTHROPIC_API_KEY"
+            };
+            let (key_field, key) = env
+                .get(preferred_field)
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (preferred_field, value.trim()))
+                .or_else(|| {
+                    env.get(fallback_field)
+                        .and_then(|v| v.as_str())
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| (fallback_field, value.trim()))
+                })
+                .unwrap_or((preferred_field, ""));
             let mut headers = Vec::new();
             if !key.is_empty() {
                 if key_field == "ANTHROPIC_API_KEY" {
@@ -813,26 +943,19 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
         }
         "codex" => {
             let cfg = provider.settings_config.get("config")?.as_str()?;
-            let base = cfg.lines().find_map(|l| {
-                let (k, v) = l.trim().split_once('=')?;
-                if k.trim() == "base_url" {
-                    Some(v.trim().trim_matches(['\"', '\'']).to_string())
-                } else {
-                    None
-                }
-            })?;
-            if base.is_empty() {
+            let base = crate::store::extract_codex_provider_string(cfg, "base_url")?
+                .trim()
+                .to_string();
+            if base.is_empty() || validate_base_url(&base).is_err() {
                 return None;
             }
-            let key = provider
-                .settings_config
-                .get("auth")
-                .and_then(|a| a.get("OPENAI_API_KEY"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let key = provider.extract_api_key("codex").unwrap_or_default();
             let mut headers = Vec::new();
-            if !key.is_empty() {
-                headers.push(("authorization".to_string(), format!("Bearer {key}")));
+            if !key.trim().is_empty() {
+                headers.push((
+                    "authorization".to_string(),
+                    format!("Bearer {}", key.trim()),
+                ));
             }
             Some(AppTarget {
                 base_url: base,
@@ -841,15 +964,11 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
         }
         "grok" => {
             let cfg = provider.settings_config.get("config")?.as_str()?;
-            let base = cfg.lines().find_map(|l| {
-                let (k, v) = l.trim().split_once('=')?;
-                if k.trim() == "models_base_url" || k.trim() == "base_url" {
-                    Some(v.trim().trim_matches(['\"', '\'']).to_string())
-                } else {
-                    None
-                }
-            })?;
-            if base.is_empty() {
+            let base = crate::store::extract_grok_endpoint_string(cfg, "models_base_url")
+                .or_else(|| crate::store::extract_grok_endpoint_string(cfg, "base_url"))?
+                .trim()
+                .to_string();
+            if base.is_empty() || validate_base_url(&base).is_err() {
                 return None;
             }
             let key = provider
@@ -857,19 +976,16 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
                 .get("auth")
                 .and_then(|a| a.get("GROK_API_KEY").or_else(|| a.get("XAI_API_KEY")))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+                .map(|value| value.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .or_else(|| {
-                    cfg.lines().find_map(|l| {
-                        let (k, v) = l.trim().split_once('=')?;
-                        let k_trim = k.trim();
-                        if k_trim == "api_key" || k_trim == "grok_api_key" || k_trim == "xai_api_key" {
-                            Some(v.trim().trim_matches(['\"', '\'']).to_string())
-                        } else {
-                            None
-                        }
-                    })
+                    crate::store::extract_grok_model_string(cfg, "api_key")
+                        .or_else(|| crate::store::extract_grok_model_string(cfg, "grok_api_key"))
+                        .or_else(|| crate::store::extract_grok_model_string(cfg, "xai_api_key"))
                 })
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let mut headers = Vec::new();
             if !key.is_empty() {
                 headers.push(("authorization".to_string(), format!("Bearer {key}")));
@@ -899,12 +1015,151 @@ pub fn local_base(port: u16, app: &str) -> String {
     format!("http://127.0.0.1:{port}/{app}")
 }
 
+pub fn validate_base_url(base_url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(base_url.trim())
+        .map_err(|_| "Base URL 必须是合法的 http(s) 地址".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Base URL 必须是合法的 http(s) 地址".into());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn normalized_toml_section(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("[[") || !trimmed.starts_with('[') {
+        return None;
+    }
+
+    // TOML 允许表头后跟行内注释，例如 `[model_providers.custom] # relay`。
+    // 仅用 `ends_with(']')` 会漏掉该表头，随后可能把下一个同名键误判为
+    // 上一个 section 的内容。扫描引号后再找真正的结束括号，兼容带 `]`
+    // 的 quoted key。
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in trimmed.char_indices().skip(1) {
+        if let Some(current_quote) = quote {
+            if current_quote == '"' && escaped {
+                escaped = false;
+            } else if current_quote == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == current_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == ']' {
+            let trailing = trimmed[index + ch.len_utf8()..].trim();
+            if !trailing.is_empty() && !trailing.starts_with('#') {
+                return None;
+            }
+            return Some(trimmed[1..index].replace(['"', '\''], ""));
+        }
+    }
+    None
+}
+
+fn rewrite_toml_keys_in_sections(
+    config_text: &str,
+    target_sections: &[&str],
+    replacements: &[(&str, &str)],
+) -> String {
+    let normalized_targets: Vec<String> = target_sections
+        .iter()
+        .map(|section| section.replace(['"', '\''], ""))
+        .collect();
+    let mut current_section = None;
+    config_text
+        .lines()
+        .map(|line| {
+            if let Some(section) = crate::store::normalized_toml_section(line) {
+                current_section = Some(section);
+                return line.to_string();
+            }
+            let Some((raw_key, _)) = line.trim().split_once('=') else {
+                return line.to_string();
+            };
+            let key = raw_key.trim();
+            let normalized_key = key.trim_matches(['"', '\'']);
+            let is_target_section = current_section.as_deref().is_some_and(|section| {
+                normalized_targets.iter().any(|target| {
+                    section == target || (target == "model" && section.starts_with("model."))
+                })
+            });
+            let Some((_, value)) = replacements
+                .iter()
+                .find(|(candidate, _)| is_target_section && normalized_key == *candidate)
+            else {
+                return line.to_string();
+            };
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            format!("{indent}{key} = {}", crate::store::quote_toml_string(value))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 只重写指定 TOML section 中的直接键，避免把 MCP 或其它 provider 的同名
+/// `base_url` 一起替换成当前 CLI 代理地址。
+fn rewrite_toml_keys_in_section(
+    config_text: &str,
+    target_section: &str,
+    replacements: &[(&str, &str)],
+) -> String {
+    let target_section = target_section.replace(['"', '\''], "");
+    let root_section = target_section.is_empty();
+    let dotted_prefix = (!target_section.is_empty()).then(|| format!("{target_section}."));
+    let mut current_section = None;
+    config_text
+        .lines()
+        .map(|line| {
+            if let Some(section) = crate::store::normalized_toml_section(line) {
+                current_section = Some(section);
+                return line.to_string();
+            }
+            let Some((raw_key, _)) = line.trim().split_once('=') else {
+                return line.to_string();
+            };
+            let key = raw_key.trim();
+            let normalized_key = key.trim_matches(['"', '\'']);
+            let is_target_section = if root_section {
+                current_section.is_none()
+            } else {
+                current_section.as_deref() == Some(target_section.as_str())
+            };
+            let Some((_, value)) = replacements.iter().find(|(candidate, _)| {
+                (is_target_section && normalized_key == *candidate)
+                    || dotted_prefix.as_deref().is_some_and(|prefix| {
+                        normalized_key.strip_prefix(prefix) == Some(*candidate)
+                    })
+            }) else {
+                return line.to_string();
+            };
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            format!("{indent}{key} = {}", crate::store::quote_toml_string(value))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rewrite_codex_base_url(config_text: &str, local: &str) -> String {
+    let provider = crate::store::extract_codex_provider_id(config_text)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "custom".to_string());
+    let section = format!("model_providers.{provider}");
+    rewrite_toml_keys_in_section(config_text, &section, &[("base_url", local)])
+}
+
 pub fn proxied_provider(
     app: &str,
     provider: &crate::store::Provider,
     port: u16,
 ) -> crate::store::Provider {
-    if crate::store::is_official_provider(provider) {
+    if crate::store::is_official_provider_for_app(app, provider) {
         return provider.clone();
     }
     let mut p = provider.clone();
@@ -920,31 +1175,17 @@ pub fn proxied_provider(
                     "ANTHROPIC_BASE_URL".into(),
                     serde_json::Value::String(local),
                 );
-                let key_field = provider
-                    .meta
-                    .get("apiKeyField")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ANTHROPIC_AUTH_TOKEN")
-                    .to_string();
-                env.insert(
-                    key_field,
-                    serde_json::Value::String(PLACEHOLDER_KEY.to_string()),
-                );
+                for key_field in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+                    env.insert(
+                        key_field.to_string(),
+                        serde_json::Value::String(PLACEHOLDER_KEY.to_string()),
+                    );
+                }
             }
         }
         "codex" => {
             if let Some(cfg) = p.settings_config.get("config").and_then(|v| v.as_str()) {
-                let rewritten: String = cfg
-                    .lines()
-                    .map(|line| {
-                        if line.trim().starts_with("base_url") {
-                            format!("base_url = \"{local}\"")
-                        } else {
-                            line.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let rewritten = rewrite_codex_base_url(cfg, &local);
                 if let Some(o) = p.settings_config.as_object_mut() {
                     o.insert("config".into(), serde_json::Value::String(rewritten));
                 }
@@ -962,24 +1203,34 @@ pub fn proxied_provider(
         }
         "grok" => {
             if let Some(cfg) = p.settings_config.get("config").and_then(|v| v.as_str()) {
-                let rewritten: String = cfg
-                    .lines()
-                    .map(|line| {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("models_base_url") {
-                            format!("models_base_url = \"{local}\"")
-                        } else if trimmed.starts_with("base_url") {
-                            format!("base_url = \"{local}\"")
-                        } else if trimmed.starts_with("api_key") {
-                            format!("api_key = \"{PLACEHOLDER_KEY}\"")
-                        } else if trimmed.starts_with("grok_api_key") {
-                            format!("grok_api_key = \"{PLACEHOLDER_KEY}\"")
-                        } else {
-                            line.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let rewritten = rewrite_toml_keys_in_section(
+                    cfg,
+                    "endpoints",
+                    &[("models_base_url", &local), ("base_url", &local)],
+                );
+                let rewritten = rewrite_toml_keys_in_section(
+                    &rewritten,
+                    "",
+                    &[("models_base_url", &local), ("base_url", &local)],
+                );
+                let rewritten = rewrite_toml_keys_in_section(
+                    &rewritten,
+                    "",
+                    &[
+                        ("api_key", PLACEHOLDER_KEY),
+                        ("grok_api_key", PLACEHOLDER_KEY),
+                        ("xai_api_key", PLACEHOLDER_KEY),
+                    ],
+                );
+                let rewritten = rewrite_toml_keys_in_sections(
+                    &rewritten,
+                    &["endpoints", "model"],
+                    &[
+                        ("api_key", PLACEHOLDER_KEY),
+                        ("grok_api_key", PLACEHOLDER_KEY),
+                        ("xai_api_key", PLACEHOLDER_KEY),
+                    ],
+                );
                 if let Some(o) = p.settings_config.as_object_mut() {
                     o.insert("config".into(), serde_json::Value::String(rewritten));
                 }
@@ -1001,24 +1252,45 @@ pub fn proxied_provider(
 }
 
 pub fn build_target_url(base_url: &str, rest: &str, query: Option<&str>) -> String {
-    let mut base = base_url.trim_end_matches('/');
+    let base_without_fragment = base_url.trim().split('#').next().unwrap_or(base_url);
+    let (base_path, base_query) = base_without_fragment
+        .split_once('?')
+        .map_or((base_without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        });
+    let mut base = base_path.trim_end_matches('/');
     if base.ends_with("/v1") && (rest.starts_with("/v1/") || rest == "/v1") {
         base = base.strip_suffix("/v1").unwrap_or(base);
     }
     let mut url = format!("{base}{rest}");
-    if let Some(q) = query {
-        if !q.is_empty() {
+    let request_query = query.filter(|value| !value.is_empty());
+    match (base_query.filter(|value| !value.is_empty()), request_query) {
+        (Some(left), Some(right)) => {
             url.push('?');
-            url.push_str(q);
+            url.push_str(left);
+            url.push('&');
+            url.push_str(right);
         }
+        (Some(value), None) | (None, Some(value)) => {
+            url.push('?');
+            url.push_str(value);
+        }
+        (None, None) => {}
     }
     url
+}
+
+pub fn is_self_proxy_target(url: &str, port: u16) -> bool {
+    reqwest::Url::parse(url).ok().is_some_and(|parsed| {
+        crate::repair::is_localhost(parsed.as_str()) && parsed.port_or_known_default() == Some(port)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Provider;
+    use axum::http::HeaderMap;
 
     #[test]
     fn test_build_target_url_normalization() {
@@ -1038,9 +1310,37 @@ mod tests {
         );
         // Query param support
         assert_eq!(
-            build_target_url("https://api.anthropic.com", "/v1/messages", Some("beta=true")),
+            build_target_url(
+                "https://api.anthropic.com",
+                "/v1/messages",
+                Some("beta=true")
+            ),
             "https://api.anthropic.com/v1/messages?beta=true"
         );
+        assert_eq!(
+            build_target_url("  https://api.example/v1  ", "/v1/models", None),
+            "https://api.example/v1/models"
+        );
+    }
+
+    #[test]
+    fn self_proxy_target_is_rejected_but_other_local_ports_are_allowed() {
+        assert!(is_self_proxy_target(
+            "http://127.0.0.1:8999/claude/v1/messages",
+            8999
+        ));
+        assert!(is_self_proxy_target(
+            "http://localhost:8999/codex/responses",
+            8999
+        ));
+        assert!(!is_self_proxy_target(
+            "http://127.0.0.1:8899/claude/v1/messages",
+            8999
+        ));
+        assert!(!is_self_proxy_target(
+            "https://api.example/v1/messages",
+            8999
+        ));
     }
 
     #[test]
@@ -1063,7 +1363,10 @@ mod tests {
         assert_eq!(target.base_url, "https://api.anthropic.com");
         assert_eq!(
             target.headers,
-            vec![("authorization".to_string(), "Bearer sk-ant-test".to_string())]
+            vec![(
+                "authorization".to_string(),
+                "Bearer sk-ant-test".to_string()
+            )]
         );
 
         let proxied = proxied_provider("claude", &p, 8999);
@@ -1077,5 +1380,165 @@ mod tests {
             PLACEHOLDER_KEY
         );
     }
-}
 
+    #[test]
+    fn proxied_claude_provider_masks_both_supported_key_fields() {
+        let p = Provider {
+            id: "test-claude".into(),
+            name: "Test Claude".into(),
+            category: Some("custom".into()),
+            settings_config: serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "ANTHROPIC_AUTH_TOKEN": "real-token",
+                    "ANTHROPIC_API_KEY": "real-api-key"
+                }
+            }),
+            meta: serde_json::json!({ "apiKeyField": "ANTHROPIC_API_KEY" }),
+            failover: serde_json::json!({ "enabled": false }),
+        };
+
+        let proxied = proxied_provider("claude", &p, DEFAULT_PORT);
+        let env = proxied.settings_config.get("env").unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN")
+                .and_then(serde_json::Value::as_str),
+            Some(PLACEHOLDER_KEY)
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY")
+                .and_then(serde_json::Value::as_str),
+            Some(PLACEHOLDER_KEY)
+        );
+    }
+
+    #[test]
+    fn toml_rewrite_matches_exact_keys() {
+        let config = "base_url_extra = \"https://keep.example\"\nbase_url = \"https://old.example\" # removed\n";
+        let rewritten = rewrite_toml_keys_in_section(
+            config,
+            "",
+            &[("base_url", "http://127.0.0.1:8999/codex")],
+        );
+        assert!(rewritten.contains("base_url_extra = \"https://keep.example\""));
+        assert!(rewritten.contains("base_url = \"http://127.0.0.1:8999/codex\""));
+        assert!(!rewritten.contains("old.example"));
+    }
+
+    #[test]
+    fn codex_proxy_rewrite_does_not_touch_unmanaged_base_urls() {
+        let config = "model_provider = \"custom\"\n\n[model_providers.custom] # selected relay\nbase_url = \"https://provider.example\"\n\n[mcp_servers.docs]\nbase_url = \"https://docs.example\"\n";
+        let rewritten = rewrite_codex_base_url(config, "http://127.0.0.1:8999/codex");
+        assert!(rewritten.contains("base_url = \"http://127.0.0.1:8999/codex\""));
+        assert!(rewritten.contains("base_url = \"https://docs.example\""));
+    }
+
+    #[test]
+    fn codex_proxy_rewrite_ignores_provider_key_in_another_section() {
+        let config =
+            "[mcp_servers.docs]\nmodel_provider = \"wrong\"\nbase_url = \"https://docs.example\"\n";
+        let rewritten = rewrite_codex_base_url(config, "http://127.0.0.1:8999/codex");
+        assert!(rewritten.contains("base_url = \"https://docs.example\""));
+        assert!(!rewritten.contains("127.0.0.1:8999"));
+    }
+
+    #[test]
+    fn grok_proxy_rewrite_scopes_model_secrets_and_supports_commented_headers() {
+        let provider = Provider {
+            id: "grok-with-mcp".into(),
+            name: "Grok with MCP".into(),
+            category: Some("custom".into()),
+            settings_config: serde_json::json!({
+                "config": "[endpoints] # managed endpoint\nmodels_base_url = \"https://provider.example/v1\"\napi_key = \"endpoint-secret\"\n\n[mcp_servers.docs]\nbase_url = \"https://docs.example\"\napi_key = \"mcp-secret\"\n\n[model.\"grok-4.5\"]\napi_key = \"model-secret\"\n"
+            }),
+            meta: serde_json::json!({}),
+            failover: serde_json::json!({}),
+        };
+
+        let proxied = proxied_provider("grok", &provider, DEFAULT_PORT);
+        let config = proxied
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(config.contains("models_base_url = \"http://127.0.0.1:8999/grok\""));
+        assert!(config.contains("[endpoints] # managed endpoint"));
+        assert!(config.contains("[mcp_servers.docs]"));
+        assert!(config.contains("base_url = \"https://docs.example\""));
+        assert!(config.contains("api_key = \"mcp-secret\""));
+        assert_eq!(config.matches("api_key = \"z-switch-proxy\"").count(), 2);
+    }
+
+    #[test]
+    fn grok_proxy_rewrite_handles_root_level_legacy_endpoints() {
+        let provider = Provider {
+            id: "legacy-grok".into(),
+            name: "Legacy Grok".into(),
+            category: Some("custom".into()),
+            settings_config: serde_json::json!({
+                "config": "models_base_url = \"https://provider.example/v1\"\napi_key = \"secret-key\"\n"
+            }),
+            meta: serde_json::json!({}),
+            failover: serde_json::json!({}),
+        };
+        let proxied = proxied_provider("grok", &provider, DEFAULT_PORT);
+        let config = proxied
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(config.contains("models_base_url = \"http://127.0.0.1:8999/grok\""));
+        assert!(config.contains("api_key = \"z-switch-proxy\""));
+        assert!(!config.contains("provider.example"));
+        assert!(!config.contains("secret-key"));
+    }
+
+    #[test]
+    fn in_flight_guard_does_not_underflow_after_counter_reset() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let guard = InFlightGuard(Some(counter.clone()));
+        counter.store(0, Ordering::Relaxed);
+        drop(guard);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        counter.store(2, Ordering::Relaxed);
+        drop(InFlightGuard(Some(counter.clone())));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn admin_token_is_required_for_control_plane() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-z-switch-admin-token", "correct".parse().unwrap());
+        assert!(authorized(&headers, &runtime_for_test("correct")));
+
+        headers.insert("x-z-switch-admin-token", "wrong".parse().unwrap());
+        assert!(!authorized(&headers, &runtime_for_test("correct")));
+        assert!(!authorized(&HeaderMap::new(), &runtime_for_test("correct")));
+    }
+
+    #[test]
+    fn connection_header_declared_names_are_treated_as_hop_by_hop() {
+        let names = hop_by_hop_headers([
+            "X-Request-Only, keep-alive".to_string(),
+            "x-response-only".to_string(),
+        ]);
+        assert!(names.contains("connection"));
+        assert!(names.contains("x-request-only"));
+        assert!(names.contains("x-response-only"));
+        assert!(names.contains("keep-alive"));
+    }
+
+    fn runtime_for_test(token: &str) -> Runtime {
+        Runtime {
+            client: reqwest::Client::new(),
+            targets: Arc::new(RwLock::new(ProxyTargets::default())),
+            config: ProxyRuntimeConfig::default(),
+            error_log_lock: tokio::sync::Mutex::new(()),
+            counters: HashMap::new(),
+            port: DEFAULT_PORT,
+            shutdown_sender: mpsc::channel(1).0,
+            admin_token: token.to_string(),
+        }
+    }
+}
