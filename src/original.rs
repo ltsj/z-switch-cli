@@ -157,8 +157,9 @@ fn apply_file(destination: &Path, snapshot_name: &str, existed: bool) -> Result<
 pub fn restore_app(app: &str) -> Result<(), String> {
     let manifest = load_manifest().map_err(|_| "尚未保存本机原始配置".to_string())?;
     live::backup_current_app(app);
+    let before = live::snapshot_app(app)?;
 
-    match app {
+    let result = match app {
         "claude" => apply_file(
             &config::get_claude_settings_path(),
             "claude-settings.json",
@@ -167,25 +168,13 @@ pub fn restore_app(app: &str) -> Result<(), String> {
         "codex" => {
             let auth_path = config::get_codex_auth_path();
             let config_path = config::get_codex_config_path();
-            let old_auth = fs::read(&auth_path).ok();
-
-            apply_file(&auth_path, "codex-auth.json", manifest.codex_auth_existed)?;
-            if let Err(error) = apply_file(
-                &config_path,
-                "codex-config.toml",
-                manifest.codex_config_existed,
-            ) {
-                match old_auth {
-                    Some(bytes) => {
-                        let _ = config::atomic_write(&auth_path, &bytes);
-                    }
-                    None => {
-                        let _ = fs::remove_file(&auth_path);
-                    }
-                }
-                return Err(format!("恢复 config.toml 失败，auth.json 已回滚：{error}"));
-            }
-            Ok(())
+            apply_file(&auth_path, "codex-auth.json", manifest.codex_auth_existed).and_then(|()| {
+                apply_file(
+                    &config_path,
+                    "codex-config.toml",
+                    manifest.codex_config_existed,
+                )
+            })
         }
         "grok" => apply_file(
             &config::get_grok_config_path(),
@@ -193,5 +182,13 @@ pub fn restore_app(app: &str) -> Result<(), String> {
             manifest.grok_config_existed,
         ),
         other => Err(format!("未知应用: {other}")),
+    };
+
+    if let Err(error) = result {
+        return match live::restore_snapshot(&before) {
+            Ok(()) => Err(format!("{error}；原始配置恢复失败，已回滚本次部分修改")),
+            Err(rollback_error) => Err(format!("{error}；回滚本次部分修改失败: {rollback_error}")),
+        };
     }
+    Ok(())
 }

@@ -94,6 +94,16 @@ pub fn normalized_toml_section(line: &str) -> Option<String> {
     None
 }
 
+/// Return whether a line starts an array-of-tables section (`[[...]]`).
+///
+/// `normalized_toml_section` intentionally returns only ordinary table
+/// headers. Callers doing line-oriented fallback parsing still need to reset
+/// their section state when an array table begins; otherwise fields inside the
+/// array can be attributed to the preceding ordinary table.
+pub fn is_toml_array_section(line: &str) -> bool {
+    line.trim().starts_with("[[")
+}
+
 /// 从 Codex 完整配置中读取当前 model_provider 对应表里的字段。
 /// 完整 config.toml 可能同时保存多个 provider，不能无条件取第一个嵌套表。
 pub fn extract_codex_provider_string(config_text: &str, key: &str) -> Option<String> {
@@ -139,6 +149,12 @@ pub fn extract_codex_provider_id(config_text: &str) -> Option<String> {
 
     let mut section = None;
     config_text.lines().find_map(|line| {
+        if is_toml_array_section(line) {
+            // An array table is not the document root. Keep a non-None
+            // sentinel so fields inside it cannot be mistaken for root keys.
+            section = Some(String::new());
+            return None;
+        }
         if let Some(header) = normalized_toml_section(line) {
             section = Some(header);
             return None;
@@ -174,6 +190,10 @@ pub fn extract_grok_endpoint_string(config_text: &str, key: &str) -> Option<Stri
 
     let mut section = None;
     config_text.lines().find_map(|line| {
+        if is_toml_array_section(line) {
+            section = Some(String::new());
+            return None;
+        }
         if let Some(header) = normalized_toml_section(line) {
             section = Some(header);
             return None;
@@ -563,6 +583,12 @@ pub fn extract_grok_model_string(config_text: &str, key: &str) -> Option<String>
     let mut model_sections = Vec::new();
     let mut values = Vec::new();
     for line in config_text.lines() {
+        if is_toml_array_section(line) {
+            // Do not let an array-of-tables inherit the preceding model
+            // section in malformed legacy TOML.
+            section = Some(String::new());
+            continue;
+        }
         if let Some(header) = normalized_toml_section(line) {
             section = Some(header.clone());
             if header == "models" {
@@ -628,6 +654,10 @@ pub fn extract_grok_default_model(config_text: &str) -> Option<String> {
     // `[other] default = ...` can be mistaken for `[models].default`.
     let mut section = None;
     config_text.lines().find_map(|line| {
+        if is_toml_array_section(line) {
+            section = Some(String::new());
+            return None;
+        }
         if let Some(header) = normalized_toml_section(line) {
             section = Some(header);
             return None;
@@ -813,13 +843,14 @@ impl Provider {
                 .filter(|value| !value.trim().is_empty())
                 .map(|s| s.to_string()),
             "grok" => {
-                let auth_key = self
-                    .settings_config
-                    .get("auth")
-                    .and_then(|a| a.get("GROK_API_KEY").or_else(|| a.get("XAI_API_KEY")))
-                    .and_then(|v| v.as_str())
-                    .filter(|value| !value.trim().is_empty())
-                    .map(|s| s.to_string());
+                let auth_key = self.settings_config.get("auth").and_then(|auth| {
+                    ["GROK_API_KEY", "XAI_API_KEY"].iter().find_map(|field| {
+                        auth.get(*field)
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string)
+                    })
+                });
                 if auth_key.is_some() {
                     return auth_key;
                 }
@@ -1531,6 +1562,41 @@ wire_api = "responses"
     }
 
     #[test]
+    fn grok_key_extraction_skips_empty_auth_key_before_fallback() {
+        let provider = Provider {
+            id: "grok-fallback".into(),
+            name: "Grok fallback".into(),
+            category: Some("custom".into()),
+            settings_config: json!({
+                "auth": {
+                    "GROK_API_KEY": "  ",
+                    "XAI_API_KEY": "xai-auth-key"
+                },
+                "config": "[endpoints]\nmodels_base_url = \"https://relay.example/v1\"\napi_key = \"toml-key\"\n"
+            }),
+            meta: json!({}),
+            failover: json!({}),
+        };
+
+        assert_eq!(
+            provider.extract_api_key("grok").as_deref(),
+            Some("xai-auth-key")
+        );
+
+        let toml_fallback = Provider {
+            settings_config: json!({
+                "auth": { "GROK_API_KEY": "" },
+                "config": "[endpoints]\nmodels_base_url = \"https://relay.example/v1\"\napi_key = \"toml-key\"\n"
+            }),
+            ..provider
+        };
+        assert_eq!(
+            toml_fallback.extract_api_key("grok").as_deref(),
+            Some("toml-key")
+        );
+    }
+
+    #[test]
     fn grok_extraction_follows_default_model() {
         let config = r#"
 [models]
@@ -1600,6 +1666,24 @@ invalid = [
     }
 
     #[test]
+    fn malformed_grok_config_does_not_read_default_from_array_table() {
+        let config = r#"
+[models]
+default = "selected-model"
+
+[[other.items]]
+default = "wrong-model"
+
+invalid = [
+"#;
+
+        assert_eq!(
+            extract_grok_default_model(config).as_deref(),
+            Some("selected-model")
+        );
+    }
+
+    #[test]
     fn grok_extraction_falls_back_when_auth_key_is_empty() {
         let config = r#"
 [models]
@@ -1657,6 +1741,39 @@ api_backend = "responses"
 
         assert_eq!(extract_grok_model_string(config, "api_key"), None);
         assert_eq!(provider.extract_api_key("grok"), None);
+    }
+
+    #[test]
+    fn malformed_grok_config_does_not_read_key_from_array_table() {
+        let config = r#"
+[models]
+default = "selected.model"
+
+[model."selected.model"]
+model = "selected.model"
+
+[[model.other]]
+api_key = "wrong-key"
+
+invalid = [
+"#;
+
+        assert_eq!(extract_grok_model_string(config, "api_key"), None);
+    }
+
+    #[test]
+    fn malformed_grok_config_does_not_read_endpoint_from_array_table() {
+        let config = r#"
+[[other.items]]
+models_base_url = "https://wrong.example"
+
+invalid = [
+"#;
+
+        assert_eq!(
+            extract_grok_endpoint_string(config, "models_base_url"),
+            None
+        );
     }
 
     #[test]

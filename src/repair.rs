@@ -4,7 +4,6 @@ use std::fs;
 use std::net::IpAddr;
 
 use crate::config;
-use crate::proxy::PLACEHOLDER_KEY;
 
 pub struct LiveSnapshot {
     pub base_url: Option<String>,
@@ -57,7 +56,7 @@ pub fn read_claude() -> LiveSnapshot {
                 .any(|k| {
                     e.get(*k)
                         .and_then(|v| v.as_str())
-                        .map(|s| s == PLACEHOLDER_KEY)
+                        .map(crate::proxy::is_placeholder_key)
                         .unwrap_or(false)
                 })
         })
@@ -78,7 +77,7 @@ pub fn read_codex() -> LiveSnapshot {
         .and_then(|v| {
             v.get("OPENAI_API_KEY")
                 .and_then(|k| k.as_str())
-                .map(|s| s == PLACEHOLDER_KEY)
+                .map(crate::proxy::is_placeholder_key)
         })
         .unwrap_or(false);
     LiveSnapshot {
@@ -103,7 +102,7 @@ fn parse_grok_snapshot(cfg: &str) -> LiveSnapshot {
     let key_is_placeholder = ["api_key", "grok_api_key", "xai_api_key"]
         .into_iter()
         .filter_map(|key| crate::store::extract_grok_model_string(cfg, key))
-        .any(|value| value == PLACEHOLDER_KEY);
+        .any(|value| crate::proxy::is_placeholder_key(&value));
     LiveSnapshot {
         base_url,
         key_is_placeholder,

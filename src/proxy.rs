@@ -22,6 +22,25 @@ pub const DEFAULT_PORT: u16 = 8999;
 pub const PROXY_APPS: &[&str] = &["claude", "codex", "grok"];
 pub const PLACEHOLDER_KEY: &str = "z-switch-proxy";
 
+/// 判断是否为 CLI 写入 live 配置时使用的占位凭据。
+///
+/// 供应商数据可能来自手工编辑、GUI 或旧版导入，前后空白不能改变它
+/// 的语义；所有持久化/导入校验都应使用这个函数，避免把占位值当真实
+/// API Key 保存或转发。
+pub fn is_placeholder_key(value: &str) -> bool {
+    value.trim() == PLACEHOLDER_KEY
+}
+
+fn is_placeholder_auth_value(value: &str) -> bool {
+    let value = value.trim();
+    if is_placeholder_key(value) {
+        return true;
+    }
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next().unwrap_or_default();
+    scheme.eq_ignore_ascii_case("bearer") && parts.next().is_some_and(is_placeholder_key)
+}
+
 #[derive(Clone, Debug)]
 pub struct ProxyRuntimeConfig {
     pub connect_timeout: Duration,
@@ -460,6 +479,9 @@ async fn admin_switch(
             reqwest::header::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
             reqwest::header::HeaderValue::from_str(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+            if is_placeholder_auth_value(value) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
         }
     }
     let base_url = if let Some(target) = payload.target {
@@ -544,6 +566,63 @@ fn target_secrets(target: &AppTarget) -> Vec<String> {
         .iter()
         .map(|(_, value)| value.clone())
         .collect()
+}
+
+/// Build the upstream request headers while preserving valid repeated client
+/// headers. Authentication supplied by the selected target intentionally
+/// replaces any client value, so a target header name is removed once before
+/// its one or more configured values are appended.
+fn forward_headers(
+    headers: &HeaderMap,
+    target_headers: &[(String, String)],
+) -> reqwest::header::HeaderMap {
+    let request_hop_by_hop = hop_by_hop_headers(
+        headers
+            .get_all("connection")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
+    let mut forwarded = reqwest::header::HeaderMap::new();
+    for (name, value) in headers.iter() {
+        let lower_name = name.as_str().to_ascii_lowercase();
+        if request_hop_by_hop.contains(lower_name.as_str())
+            || AUTH_HEADERS.contains(&lower_name.as_str())
+            || lower_name == "x-z-switch-admin-token"
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            forwarded.append(name, value);
+        }
+    }
+
+    let target_hop_by_hop = hop_by_hop_headers(
+        target_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            .map(|(_, value)| value.clone()),
+    );
+    let mut target_names = HashSet::new();
+    for (raw_name, raw_value) in target_headers {
+        let lower_name = raw_name.to_ascii_lowercase();
+        if target_hop_by_hop.contains(&lower_name) || lower_name == "x-z-switch-admin-token" {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(raw_name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(raw_value),
+        ) {
+            if target_names.insert(name.clone()) {
+                forwarded.remove(&name);
+            }
+            forwarded.append(name, value);
+        }
+    }
+    forwarded
 }
 
 fn safe_error_detail(raw: &str, url: &str, secrets: &[String]) -> String {
@@ -668,41 +747,7 @@ async fn forward(
             .map(|hint| hint.stream)
             .unwrap_or(false);
 
-    let request_hop_by_hop = hop_by_hop_headers(
-        headers
-            .get_all("connection")
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .map(str::to_string),
-    );
-    let mut fwd = reqwest::header::HeaderMap::new();
-    for (name, value) in headers.iter() {
-        let lname = name.as_str().to_ascii_lowercase();
-        if request_hop_by_hop.contains(lname.as_str()) {
-            continue;
-        }
-        if AUTH_HEADERS.contains(&lname.as_str()) || lname == "x-z-switch-admin-token" {
-            continue;
-        }
-        if let (Ok(n), Ok(v)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            fwd.insert(n, v);
-        }
-    }
-    for (k, v) in &target.headers {
-        let lname = k.to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&lname.as_str()) || lname == "x-z-switch-admin-token" {
-            continue;
-        }
-        if let (Ok(n), Ok(val)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            reqwest::header::HeaderValue::from_str(v),
-        ) {
-            fwd.insert(n, val);
-        }
-    }
+    let fwd = forward_headers(&headers, &target.headers);
 
     let mut request = rt
         .client
@@ -894,7 +939,7 @@ async fn forward(
 }
 
 pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Option<AppTarget> {
-    match app {
+    let target = match app {
         "claude" => {
             let env = provider.settings_config.get("env")?.as_object()?;
             let base = env.get("ANTHROPIC_BASE_URL")?.as_str()?.trim().to_string();
@@ -971,21 +1016,11 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
             if base.is_empty() || validate_base_url(&base).is_err() {
                 return None;
             }
-            let key = provider
-                .settings_config
-                .get("auth")
-                .and_then(|a| a.get("GROK_API_KEY").or_else(|| a.get("XAI_API_KEY")))
-                .and_then(|v| v.as_str())
-                .map(|value| value.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    crate::store::extract_grok_model_string(cfg, "api_key")
-                        .or_else(|| crate::store::extract_grok_model_string(cfg, "grok_api_key"))
-                        .or_else(|| crate::store::extract_grok_model_string(cfg, "xai_api_key"))
-                })
-                .unwrap_or_default()
-                .trim()
-                .to_string();
+            // Keep proxy target extraction in sync with Provider::extract_api_key:
+            // an empty preferred auth field must not hide a valid fallback field
+            // or a credential stored in the TOML config.
+            let key = provider.extract_api_key("grok").unwrap_or_default();
+            let key = key.trim();
             let mut headers = Vec::new();
             if !key.is_empty() {
                 headers.push(("authorization".to_string(), format!("Bearer {key}")));
@@ -996,7 +1031,17 @@ pub fn target_from_provider(app: &str, provider: &crate::store::Provider) -> Opt
             })
         }
         _ => None,
-    }
+    }?;
+
+    // providers.json 可由 GUI、旧版本或用户手工编辑；如果其中残留了
+    // 代理写入 live 配置时使用的占位凭据，后台 worker 不能把它当成真实
+    // Key 发往上游。服务层会拒绝新的脏配置，这个运行期检查负责兜住
+    // 已经落盘的历史损坏数据。
+    let has_placeholder = target
+        .headers
+        .iter()
+        .any(|(_, value)| is_placeholder_auth_value(value));
+    (!has_placeholder).then_some(target)
 }
 
 pub fn set_target(targets: &SharedTargets, app: &str, target: AppTarget) {
@@ -1074,6 +1119,13 @@ fn rewrite_toml_keys_in_sections(
     config_text
         .lines()
         .map(|line| {
+            if crate::store::is_toml_array_section(line) {
+                // Array-of-tables must not inherit the preceding ordinary
+                // section. Keep its fields untouched because this helper
+                // only rewrites ordinary table sections.
+                current_section = None;
+                return line.to_string();
+            }
             if let Some(section) = crate::store::normalized_toml_section(line) {
                 current_section = Some(section);
                 return line.to_string();
@@ -1113,11 +1165,18 @@ fn rewrite_toml_keys_in_section(
     let root_section = target_section.is_empty();
     let dotted_prefix = (!target_section.is_empty()).then(|| format!("{target_section}."));
     let mut current_section = None;
+    let mut in_array_table = false;
     config_text
         .lines()
         .map(|line| {
+            if crate::store::is_toml_array_section(line) {
+                current_section = None;
+                in_array_table = true;
+                return line.to_string();
+            }
             if let Some(section) = crate::store::normalized_toml_section(line) {
                 current_section = Some(section);
+                in_array_table = false;
                 return line.to_string();
             }
             let Some((raw_key, _)) = line.trim().split_once('=') else {
@@ -1126,7 +1185,7 @@ fn rewrite_toml_keys_in_section(
             let key = raw_key.trim();
             let normalized_key = key.trim_matches(['"', '\'']);
             let is_target_section = if root_section {
-                current_section.is_none()
+                current_section.is_none() && !in_array_table
             } else {
                 current_section.as_deref() == Some(target_section.as_str())
             };
@@ -1147,11 +1206,17 @@ fn rewrite_toml_keys_in_section(
 }
 
 fn rewrite_codex_base_url(config_text: &str, local: &str) -> String {
-    let provider = crate::store::extract_codex_provider_id(config_text)
+    if let Some(provider) = crate::store::extract_codex_provider_id(config_text)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "custom".to_string());
-    let section = format!("model_providers.{provider}");
-    rewrite_toml_keys_in_section(config_text, &section, &[("base_url", local)])
+    {
+        let section = format!("model_providers.{provider}");
+        rewrite_toml_keys_in_section(config_text, &section, &[("base_url", local)])
+    } else {
+        // Older Codex configs may keep base_url at the document root instead
+        // of under model_providers.<id>. target_from_provider accepts that
+        // shape, so proxy mode must rewrite it as well.
+        rewrite_toml_keys_in_section(config_text, "", &[("base_url", local)])
+    }
 }
 
 pub fn proxied_provider(
@@ -1344,6 +1409,23 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_key_check_ignores_surrounding_whitespace() {
+        assert!(is_placeholder_key(PLACEHOLDER_KEY));
+        assert!(is_placeholder_key("  z-switch-proxy\t"));
+        assert!(!is_placeholder_key("z-switch-proxy-other"));
+        assert!(!is_placeholder_key(""));
+    }
+
+    #[test]
+    fn placeholder_auth_check_handles_bearer_spacing_and_case() {
+        assert!(is_placeholder_auth_value("  bearer\tz-switch-proxy  "));
+        assert!(is_placeholder_auth_value("Bearer  z-switch-proxy"));
+        assert!(is_placeholder_auth_value("z-switch-proxy"));
+        assert!(!is_placeholder_auth_value("Bearer real-key"));
+        assert!(!is_placeholder_auth_value("Basic z-switch-proxy"));
+    }
+
+    #[test]
     fn test_target_from_provider_and_proxied_provider() {
         let p = Provider {
             id: "test-claude".into(),
@@ -1379,6 +1461,25 @@ mod tests {
             env.get("ANTHROPIC_AUTH_TOKEN").unwrap().as_str().unwrap(),
             PLACEHOLDER_KEY
         );
+    }
+
+    #[test]
+    fn target_from_provider_rejects_proxy_placeholder_key() {
+        let provider = Provider {
+            id: "corrupt-claude".into(),
+            name: "Corrupt Claude".into(),
+            category: Some("custom".into()),
+            settings_config: serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example",
+                    "ANTHROPIC_AUTH_TOKEN": "  z-switch-proxy  "
+                }
+            }),
+            meta: serde_json::json!({}),
+            failover: serde_json::json!({}),
+        };
+
+        assert!(target_from_provider("claude", &provider).is_none());
     }
 
     #[test]
@@ -1440,6 +1541,59 @@ mod tests {
         let rewritten = rewrite_codex_base_url(config, "http://127.0.0.1:8999/codex");
         assert!(rewritten.contains("base_url = \"https://docs.example\""));
         assert!(!rewritten.contains("127.0.0.1:8999"));
+    }
+
+    #[test]
+    fn codex_proxy_rewrite_supports_legacy_root_base_url() {
+        let config = r#"model = "gpt-4"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+
+[mcp_servers.docs]
+base_url = "https://docs.example"
+"#;
+        let rewritten = rewrite_codex_base_url(config, "http://127.0.0.1:8999/codex");
+        assert!(rewritten.contains("base_url = \"http://127.0.0.1:8999/codex\""));
+        assert!(rewritten.contains("base_url = \"https://docs.example\""));
+    }
+
+    #[test]
+    fn codex_proxy_rewrite_does_not_touch_array_table_fields() {
+        let config = r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://provider.example"
+
+[[mcp_servers.docs]]
+base_url = "https://array.example"
+"#;
+        let rewritten = rewrite_codex_base_url(config, "http://127.0.0.1:8999/codex");
+        assert_eq!(rewritten.matches("http://127.0.0.1:8999/codex").count(), 1);
+        assert!(rewritten.contains("base_url = \"https://array.example\""));
+    }
+
+    #[test]
+    fn grok_proxy_rewrite_does_not_touch_array_table_fields() {
+        let provider = Provider {
+            id: "grok-array".into(),
+            name: "Grok array".into(),
+            category: Some("custom".into()),
+            settings_config: serde_json::json!({
+                "config": "[endpoints]\nmodels_base_url = \"https://provider.example/v1\"\n\n[[mcp_servers.docs]]\nmodels_base_url = \"https://array.example/v1\"\napi_key = \"array-secret\"\n"
+            }),
+            meta: serde_json::json!({}),
+            failover: serde_json::json!({}),
+        };
+
+        let proxied = proxied_provider("grok", &provider, DEFAULT_PORT);
+        let config = proxied
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(config.contains("models_base_url = \"http://127.0.0.1:8999/grok\""));
+        assert!(config.contains("models_base_url = \"https://array.example/v1\""));
+        assert!(config.contains("api_key = \"array-secret\""));
     }
 
     #[test]
@@ -1527,6 +1681,43 @@ mod tests {
         assert!(names.contains("x-request-only"));
         assert!(names.contains("x-response-only"));
         assert!(names.contains("keep-alive"));
+    }
+
+    #[test]
+    fn forward_headers_preserves_repeated_client_values_and_target_override() {
+        let mut headers = HeaderMap::new();
+        headers.append("cookie", "session=one".parse().unwrap());
+        headers.append("cookie", "theme=dark".parse().unwrap());
+        headers.append("accept", "text/event-stream".parse().unwrap());
+        headers.insert("authorization", "Bearer client".parse().unwrap());
+        headers.insert("connection", "x-request-only".parse().unwrap());
+        headers.insert("x-request-only", "must-not-forward".parse().unwrap());
+
+        let forwarded = forward_headers(
+            &headers,
+            &[
+                ("cookie".into(), "session=target".into()),
+                ("x-target".into(), "one".into()),
+                ("x-target".into(), "two".into()),
+            ],
+        );
+
+        let cookies: Vec<_> = forwarded
+            .get_all("cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["session=target"]);
+        let target_values: Vec<_> = forwarded
+            .get_all("x-target")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(target_values, vec!["one", "two"]);
+        assert_eq!(forwarded.get_all("accept").iter().count(), 1);
+        assert!(forwarded.get("authorization").is_none());
+        assert!(forwarded.get("connection").is_none());
+        assert!(forwarded.get("x-request-only").is_none());
     }
 
     fn runtime_for_test(token: &str) -> Runtime {

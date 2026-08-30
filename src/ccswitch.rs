@@ -60,14 +60,14 @@ fn has_proxy_placeholder(app: &str, cfg: &Value) -> bool {
                     .any(|key| {
                         env.get(*key)
                             .and_then(Value::as_str)
-                            .is_some_and(|value| value == crate::proxy::PLACEHOLDER_KEY)
+                            .is_some_and(crate::proxy::is_placeholder_key)
                     })
             }),
         "codex" => cfg
             .get("auth")
             .and_then(|auth| auth.get("OPENAI_API_KEY"))
             .and_then(Value::as_str)
-            .is_some_and(|value| value == crate::proxy::PLACEHOLDER_KEY),
+            .is_some_and(crate::proxy::is_placeholder_key),
         _ => false,
     }
 }

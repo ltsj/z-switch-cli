@@ -602,7 +602,7 @@ pub async fn interactive_add(service: &SwitchService) {
         .prompt()
     {
         Ok(m) => m.trim().to_string(),
-        _ => String::new(),
+        _ => return,
     };
 
     let wire_api = if matches!(app_choice.as_str(), "codex" | "grok") {
@@ -632,7 +632,8 @@ pub async fn interactive_add(service: &SwitchService) {
             .prompt()
             {
                 Ok(s) if s.starts_with("ANTHROPIC_API_KEY") => "ANTHROPIC_API_KEY",
-                _ => "ANTHROPIC_AUTH_TOKEN",
+                Ok(_) => "ANTHROPIC_AUTH_TOKEN",
+                Err(_) => return,
             };
 
             let mut env = serde_json::json!({
@@ -785,7 +786,7 @@ pub async fn interactive_edit(service: &SwitchService) {
     {
         Ok(m) if m.trim().is_empty() => current_model.clone(),
         Ok(m) => m.trim().to_string(),
-        _ => String::new(),
+        _ => return,
     };
 
     let mut new_p = old_p.clone();

@@ -247,16 +247,50 @@ fn snapshot(paths: &Paths) -> Result<Vec<FileSnapshot>, String> {
 }
 
 fn restore(snapshots: &[FileSnapshot]) -> Result<(), String> {
+    let mut applied: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     for snap in snapshots {
-        match &snap.content {
-            Some(content) => atomic_write(&snap.path, content)?,
-            None => {
-                if snap.path.exists() {
-                    fs::remove_file(&snap.path)
-                        .map_err(|e| format!("删除 {} 失败: {e}", snap.path.display()))?;
+        let previous = match fs::read(&snap.path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "读取 {} 当前状态失败: {error}",
+                    snap.path.display()
+                ));
+            }
+        };
+        let result = match &snap.content {
+            Some(content) => atomic_write(&snap.path, content),
+            None => match fs::remove_file(&snap.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("删除 {} 失败: {error}", snap.path.display())),
+            },
+        };
+        if let Err(error) = result {
+            let mut rollback_errors = Vec::new();
+            for (path, content) in applied.iter().rev() {
+                let rollback = match content {
+                    Some(content) => atomic_write(path, content),
+                    None => match fs::remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(format!("删除 {} 失败: {error}", path.display())),
+                    },
+                };
+                if let Err(rollback_error) = rollback {
+                    rollback_errors.push(format!("恢复 {} 失败: {rollback_error}", path.display()));
                 }
             }
+            if rollback_errors.is_empty() {
+                return Err(format!("{error}；已回滚已恢复的桌面配置文件"));
+            }
+            return Err(format!(
+                "{error}；桌面配置文件回滚失败: {}",
+                rollback_errors.join("；")
+            ));
         }
+        applied.push((snap.path.clone(), previous));
     }
     Ok(())
 }

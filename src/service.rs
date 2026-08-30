@@ -64,27 +64,40 @@ fn provider_has_proxy_placeholder(app: &str, provider: &Provider) -> bool {
                 ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
                     .iter()
                     .filter_map(|key| env.get(*key).and_then(Value::as_str))
-                    .any(|value| value == proxy::PLACEHOLDER_KEY)
+                    .any(proxy::is_placeholder_key)
             }),
         "codex" => provider
             .settings_config
             .get("auth")
             .and_then(|auth| auth.get("OPENAI_API_KEY"))
             .and_then(Value::as_str)
-            .is_some_and(|value| value == proxy::PLACEHOLDER_KEY),
-        "grok" => provider
-            .settings_config
-            .get("config")
-            .and_then(Value::as_str)
-            .is_some_and(|config| {
-                ["api_key", "grok_api_key", "xai_api_key"]
-                    .iter()
-                    .any(|key| {
-                        store::extract_grok_endpoint_string(config, key)
-                            .or_else(|| store::extract_grok_model_string(config, key))
-                            .is_some_and(|value| value == proxy::PLACEHOLDER_KEY)
-                    })
-            }),
+            .is_some_and(proxy::is_placeholder_key),
+        "grok" => {
+            let auth_placeholder = provider
+                .settings_config
+                .get("auth")
+                .and_then(Value::as_object)
+                .is_some_and(|auth| {
+                    ["GROK_API_KEY", "XAI_API_KEY"]
+                        .iter()
+                        .filter_map(|key| auth.get(*key).and_then(Value::as_str))
+                        .any(proxy::is_placeholder_key)
+                });
+            let config_placeholder = provider
+                .settings_config
+                .get("config")
+                .and_then(Value::as_str)
+                .is_some_and(|config| {
+                    ["api_key", "grok_api_key", "xai_api_key"]
+                        .iter()
+                        .any(|key| {
+                            store::extract_grok_endpoint_string(config, key)
+                                .or_else(|| store::extract_grok_model_string(config, key))
+                                .is_some_and(|value| proxy::is_placeholder_key(&value))
+                        })
+                });
+            auth_placeholder || config_placeholder
+        }
         _ => false,
     }
 }
@@ -665,10 +678,13 @@ impl SwitchService {
             return Err("供应商 Base URL 指向当前 CLI 代理端口，已拒绝递归路由".into());
         }
         let current_id = data.current.clone();
+        let previous_provider = current_id
+            .as_ref()
+            .and_then(|id| data.providers.get(id))
+            .cloned();
         let previous_target = if app_was_routed {
-            current_id
+            previous_provider
                 .as_ref()
-                .and_then(|id| data.providers.get(id))
                 .filter(|provider| !store::is_official_provider_for_app(app, provider))
                 .and_then(|provider| proxy::target_from_provider(app, provider))
         } else {
@@ -718,6 +734,7 @@ impl SwitchService {
                     app_was_routed,
                     previous_target.clone(),
                     started_here,
+                    previous_provider.clone(),
                 )
                 .await);
             }
@@ -735,6 +752,7 @@ impl SwitchService {
                         app_was_routed,
                         previous_target.clone(),
                         started_here,
+                        previous_provider.clone(),
                     )
                     .await);
                 }
@@ -751,6 +769,7 @@ impl SwitchService {
                     app_was_routed,
                     previous_target,
                     started_here,
+                    previous_provider.clone(),
                 )
                 .await);
             }
@@ -784,6 +803,7 @@ impl SwitchService {
                 app_was_routed,
                 previous_target.clone(),
                 started_here,
+                previous_provider.clone(),
             )
             .await);
         }
@@ -799,6 +819,7 @@ impl SwitchService {
                     app_was_routed,
                     previous_target.clone(),
                     started_here,
+                    previous_provider.clone(),
                 )
                 .await);
             }
@@ -814,6 +835,7 @@ impl SwitchService {
                 app_was_routed,
                 previous_target,
                 started_here,
+                previous_provider.clone(),
             )
             .await);
         }
@@ -925,6 +947,7 @@ impl SwitchService {
                         true,
                         previous_target.clone(),
                         None,
+                        previous_provider.clone(),
                     )
                     .await);
                 }
@@ -941,6 +964,7 @@ impl SwitchService {
                         true,
                         previous_target.clone(),
                         None,
+                        previous_provider.clone(),
                     )
                     .await);
                 }
@@ -957,6 +981,7 @@ impl SwitchService {
                         false,
                         None,
                         None,
+                        previous_provider.clone(),
                     )
                     .await);
                 }
@@ -973,6 +998,7 @@ impl SwitchService {
                     route_active,
                     previous_target,
                     None,
+                    previous_provider,
                 )
                 .await);
             }
@@ -1113,6 +1139,7 @@ impl SwitchService {
                                 route_active,
                                 previous_target.clone(),
                                 None,
+                                Some(target_provider.clone()),
                             )
                             .await);
                         }
@@ -1131,6 +1158,7 @@ impl SwitchService {
                             route_active,
                             previous_target.clone(),
                             None,
+                            Some(target_provider.clone()),
                         )
                         .await);
                     }
@@ -1155,6 +1183,7 @@ impl SwitchService {
                         true,
                         previous_target.clone(),
                         None,
+                        Some(target_provider.clone()),
                     )
                     .await);
                 }
@@ -1177,6 +1206,7 @@ impl SwitchService {
                     route_active,
                     previous_target,
                     None,
+                    Some(target_provider),
                 )
                 .await);
             }
@@ -1269,10 +1299,14 @@ impl SwitchService {
             .await
             .ok()
             .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app));
+        let previous_provider = root
+            .apps
+            .get(app)
+            .and_then(|data| data.current.as_ref().and_then(|id| data.providers.get(id)))
+            .cloned();
         let previous_target = if app_was_routed {
-            root.apps
-                .get(app)
-                .and_then(|data| data.current.as_ref().and_then(|id| data.providers.get(id)))
+            previous_provider
+                .as_ref()
                 .filter(|provider| !store::is_official_provider_for_app(app, provider))
                 .and_then(|provider| proxy::target_from_provider(app, provider))
         } else {
@@ -1295,6 +1329,7 @@ impl SwitchService {
                     true,
                     previous_target.clone(),
                     None,
+                    previous_provider.clone(),
                 )
                 .await);
             }
@@ -1324,6 +1359,7 @@ impl SwitchService {
                 app_was_routed,
                 previous_target,
                 None,
+                previous_provider,
             )
             .await);
         }
@@ -1775,26 +1811,54 @@ async fn rollback_app_change(
     app_was_routed: bool,
     previous_target: Option<proxy::AppTarget>,
     started_here: Option<u32>,
+    fallback_provider: Option<Provider>,
 ) -> String {
     let mut rollback_errors = Vec::new();
+    let desired_target = if app_was_routed {
+        previous_target
+    } else {
+        None
+    };
 
     if let Some(pid) = started_here {
         if let Err(error) = daemon::stop_if_pid(port, pid).await {
             rollback_errors.push(format!("停止本次启动的代理失败: {error}"));
         }
-    } else if daemon_was_alive {
-        let target = if app_was_routed {
-            previous_target
-        } else {
-            None
-        };
-        if let Err(error) = daemon::send_switch(port, app, target).await {
-            rollback_errors.push(format!("恢复原代理路由失败: {error}"));
-        }
     }
 
-    if let Err(error) = live::restore_snapshot(&snapshot) {
-        rollback_errors.push(format!("恢复原 live 配置失败: {error}"));
+    // stop_if_pid() 可能因为进程退出竞态返回错误，也可能端口被同一 CLI
+    // 的新 worker 接管。只要代理仍能响应，就把原路由状态恢复到操作前。
+    let can_restore_route = daemon_was_alive || started_here.is_some();
+    let mut status = daemon::get_status(port).await.ok();
+    if status.is_some() && can_restore_route {
+        if let Err(error) = daemon::send_switch(port, app, desired_target).await {
+            rollback_errors.push(format!("恢复原代理路由失败: {error}"));
+        }
+        status = daemon::get_status(port).await.ok();
+    }
+
+    let route_restored = app_was_routed
+        && can_restore_route
+        && status
+            .as_ref()
+            .is_some_and(|current| current.routed_apps.iter().any(|routed| routed == app));
+    let snapshot_port = live::snapshot_proxy_port(&snapshot, app);
+
+    // 只有代理仍然存活且原 app 路由确实恢复时，localhost 快照才是可用
+    // 的。否则优先写回真实 provider，避免恢复一个已经无人监听的地址。
+    let restore_snapshot = snapshot_port != Some(port) || route_restored;
+    if restore_snapshot {
+        if let Err(error) = live::restore_snapshot(&snapshot) {
+            rollback_errors.push(format!("恢复原 live 配置失败: {error}"));
+        }
+    } else if let Some(provider) = fallback_provider {
+        if let Err(error) = live::write_live(app, &provider, false) {
+            rollback_errors.push(format!("代理已不可用，恢复真实 live 配置失败: {error}"));
+        }
+    } else {
+        rollback_errors.push(format!(
+            "代理已不可用，且没有可用于恢复 {app} 的真实供应商配置"
+        ));
     }
 
     if rollback_errors.is_empty() {
@@ -1998,5 +2062,23 @@ mod tests {
             failover: json!({}),
         };
         assert!(validate_provider("grok", &grok).is_err());
+
+        let grok_auth = Provider {
+            settings_config: json!({
+                "auth": { "GROK_API_KEY": proxy::PLACEHOLDER_KEY },
+                "config": "[endpoints]\nmodels_base_url = \"https://relay.example\"\n"
+            }),
+            ..grok.clone()
+        };
+        assert!(validate_provider("grok", &grok_auth).is_err());
+
+        let xai_auth = Provider {
+            settings_config: json!({
+                "auth": { "XAI_API_KEY": proxy::PLACEHOLDER_KEY },
+                "config": "[endpoints]\nmodels_base_url = \"https://relay.example\"\n"
+            }),
+            ..grok
+        };
+        assert!(validate_provider("grok", &xai_auth).is_err());
     }
 }

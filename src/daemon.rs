@@ -1,6 +1,6 @@
 //! 代理常驻后台守护进程管理器与 IPC 客户端。
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -97,18 +97,18 @@ pub fn validate_port(port: u16) -> Result<(), String> {
 
 /// 返回当前应用对应的 CLI 代理端口。
 ///
-/// live 配置也可能来自 GUI；只有存在当前 CLI 自己的 PID 文件时，才把
-/// live 里的 localhost 端口视为 CLI 代理，避免把 GUI 或其它进程误当成 CLI。
+/// `live::proxy_port` 只识别 z-switch 自己写入的 `/<app>` 路径，因此这里
+/// 不再依赖 PID 文件。worker 异常退出时 PID 文件可能已被清理，但 live
+/// 配置仍然保留；继续返回该端口，才能让 `use --proxy`、`repair` 等命令
+/// 接管并修复这个自定义端口。端口是否真的属于当前 CLI，控制操作会再
+/// 通过健康接口、PID 和管理 token 确认。
 pub fn preferred_port_for_app(app: &str) -> Option<u16> {
-    let port = live::proxy_port(app)?;
-    // 端口号本身不能证明归 CLI 所有。PID 文件仍兼容旧版无 token 的格式，
-    // 但真正的控制操作还会通过健康接口的 PID 和状态接口再次确认。
-    read_pid_file(port).map(|_| port)
+    live::proxy_port(app)
 }
 
 /// 返回 TUI/诊断可管理的 CLI 代理端口。
-/// 默认端口始终保留，额外端口从 PID 文件中发现；PID 文件即使对应残留
-/// 进程也保留在列表里，方便用户通过 status/stop 清理现场。
+/// 默认端口始终保留，额外端口从 PID 文件和 live 配置中发现；PID 文件即使
+/// 对应残留进程也保留在列表里，方便用户通过 status/stop 清理现场。
 pub fn known_cli_ports() -> Vec<u16> {
     let mut ports = vec![proxy::DEFAULT_PORT];
     let dir = config::get_app_config_dir();
@@ -187,26 +187,29 @@ pub fn write_pid_file(port: u16, admin_token: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn remove_pid_file(port: u16) {
-    let _ = fs::remove_file(pid_file_path_for(port));
+fn remove_owned_pid_file(port: u16, pid: u32) {
+    // Check each possible path independently. `read_pid_file()` may return a
+    // legacy record while the primary file has already been replaced by a new
+    // worker; removing both paths after that lookup could delete the new PID
+    // file. All cooperating lifecycle operations also serialize on the start
+    // lock, but the worker can clean up after an external shutdown.
+    let _ = remove_pid_file_if_matches(&pid_file_path_for(port), port, pid);
     if port != proxy::DEFAULT_PORT {
-        // 只清理 legacy 文件中明确属于这个端口的记录，不能误删默认
-        // 端口上另一实例的 PID 文件。
-        let legacy = legacy_pid_file_path();
-        let belongs_to_port = fs::read_to_string(&legacy)
-            .ok()
-            .and_then(|content| serde_json::from_str::<PidInfo>(&content).ok())
-            .is_some_and(|info| info.port == port);
-        if belongs_to_port {
-            let _ = fs::remove_file(legacy);
-        }
+        let _ = remove_pid_file_if_matches(&legacy_pid_file_path(), port, pid);
     }
 }
 
-fn remove_owned_pid_file(port: u16, pid: u32) {
-    if read_pid_file(port).is_some_and(|info| info.pid == pid) {
-        remove_pid_file(port);
+fn remove_pid_file_if_matches(path: &Path, port: u16, pid: u32) -> bool {
+    let Some(info) = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<PidInfo>(&content).ok())
+    else {
+        return false;
+    };
+    if info.port != port || info.pid != pid {
+        return false;
     }
+    fs::remove_file(path).is_ok()
 }
 
 /// 判断 PID 文件对应的进程是否仍存在。
@@ -259,22 +262,23 @@ fn http_client(timeout_ms: u64) -> reqwest::Client {
 
 const ADMIN_TOKEN_HEADER: &str = "x-z-switch-admin-token";
 
-fn admin_token(port: u16) -> Option<String> {
-    read_pid_file(port).and_then(|info| info.admin_token)
-}
-
 fn pid_matches_health(port: u16, health: &AdminHealthResponse) -> bool {
     health.port == port && read_pid_file(port).is_some_and(|info| info.pid == health.pid)
 }
 
-async fn verify_owned_proxy(port: u16) -> Result<AdminHealthResponse, String> {
+async fn verify_owned_proxy(port: u16) -> Result<(AdminHealthResponse, Option<String>), String> {
     let health = check_health(port).await?;
-    if !pid_matches_health(port, &health) {
+    let Some(info) = read_pid_file(port) else {
+        return Err(format!(
+            "端口 {port} 不是当前 CLI 代理实例，拒绝执行控制操作"
+        ));
+    };
+    if health.port != port || info.pid != health.pid {
         return Err(format!(
             "端口 {port} 不是当前 CLI 代理实例，拒绝执行控制操作"
         ));
     }
-    Ok(health)
+    Ok((health, info.admin_token))
 }
 
 pub async fn check_health(port: u16) -> Result<AdminHealthResponse, String> {
@@ -296,10 +300,10 @@ pub async fn check_health(port: u16) -> Result<AdminHealthResponse, String> {
 
 pub async fn get_status(port: u16) -> Result<AdminStatusResponse, String> {
     validate_port(port)?;
-    verify_owned_proxy(port).await?;
+    let (_, admin_token) = verify_owned_proxy(port).await?;
     let url = format!("http://127.0.0.1:{port}/_admin/status");
     let mut request = http_client(2000).get(&url);
-    if let Some(token) = admin_token(port) {
+    if let Some(token) = admin_token {
         request = request.header(ADMIN_TOKEN_HEADER, token);
     }
     let resp = request
@@ -321,14 +325,14 @@ pub async fn send_switch(
     target: Option<AppTarget>,
 ) -> Result<AdminSwitchResponse, String> {
     validate_port(port)?;
-    verify_owned_proxy(port).await?;
+    let (_, admin_token) = verify_owned_proxy(port).await?;
     let url = format!("http://127.0.0.1:{port}/_admin/switch");
     let payload = AdminSwitchRequest {
         app: app.to_string(),
         target,
     };
     let mut request = http_client(3000).post(&url).json(&payload);
-    if let Some(token) = admin_token(port) {
+    if let Some(token) = admin_token {
         request = request.header(ADMIN_TOKEN_HEADER, token);
     }
     let resp = request
@@ -346,10 +350,10 @@ pub async fn send_switch(
 
 pub async fn send_shutdown(port: u16) -> Result<(), String> {
     validate_port(port)?;
-    verify_owned_proxy(port).await?;
+    let (_, admin_token) = verify_owned_proxy(port).await?;
     let url = format!("http://127.0.0.1:{port}/_admin/shutdown");
     let mut request = http_client(2000).post(&url);
-    if let Some(token) = admin_token(port) {
+    if let Some(token) = admin_token {
         request = request.header(ADMIN_TOKEN_HEADER, token);
     }
     let resp = request
@@ -696,5 +700,31 @@ mod tests {
         assert!(validate_port(0).is_err());
         assert!(validate_port(1).is_ok());
         assert!(validate_port(u16::MAX).is_ok());
+    }
+
+    #[test]
+    fn remove_pid_file_if_matches_does_not_remove_a_newer_instance() {
+        let path = std::env::temp_dir().join(format!(
+            "z_switch_pid_test_{}_{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let newer = PidInfo {
+            pid: 2222,
+            port: 8999,
+            started_at: 2,
+            admin_token: Some("new".into()),
+        };
+        fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
+
+        assert!(!remove_pid_file_if_matches(&path, 8999, 1111));
+        assert!(path.exists());
+        assert!(!remove_pid_file_if_matches(&path, 8899, 2222));
+        assert!(path.exists());
+        assert!(remove_pid_file_if_matches(&path, 8999, 2222));
+        assert!(!path.exists());
     }
 }

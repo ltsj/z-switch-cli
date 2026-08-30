@@ -70,11 +70,24 @@ fn prune_old_backups(dir: &Path, keep: usize) {
     for entry in entries.flatten() {
         if let Ok(meta) = entry.metadata() {
             // The directory is user-visible and may contain manual notes or
-            // other files. Only remove backups created by z-switch itself.
+            // other backups. Match the exact names emitted by `backup_file`;
+            // a generic `.bak` suffix is not ownership proof.
             let is_z_switch_backup = entry
                 .path()
-                .extension()
-                .is_some_and(|extension| extension == "bak");
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.rsplit_once('-'))
+                .is_some_and(|(tag, timestamp)| {
+                    matches!(
+                        tag,
+                        "claude-settings" | "codex-auth" | "codex-config" | "grok-config"
+                    ) && !timestamp.is_empty()
+                        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "bak")
+                });
             if meta.is_file() && is_z_switch_backup {
                 if let Ok(time) = meta.modified() {
                     files.push((entry.path(), time));
@@ -147,19 +160,59 @@ pub fn snapshot_app(app: &str) -> Result<AppLiveSnapshot, String> {
 }
 
 pub fn restore_snapshot(snapshot: &AppLiveSnapshot) -> Result<(), String> {
+    let mut applied = Vec::new();
     for file in &snapshot.files {
-        match &file.content {
-            Some(content) => config::atomic_write(&file.path, content)?,
+        let previous = match fs::read(&file.path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                let detail = format!("读取 {} 当前状态失败: {error}", file.path.display());
+                return Err(with_restore_rollback_error(detail, &applied));
+            }
+        };
+
+        let result = match &file.content {
+            Some(content) => config::atomic_write(&file.path, content),
             None => match fs::remove_file(&file.path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("删除 {} 失败: {error}", file.path.display()));
-                }
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("删除 {} 失败: {error}", file.path.display())),
             },
+        };
+        if let Err(error) = result {
+            return Err(with_restore_rollback_error(error, &applied));
         }
+        applied.push((file.path.clone(), previous));
     }
     Ok(())
+}
+
+fn with_restore_rollback_error(
+    original_error: String,
+    applied: &[(PathBuf, Option<Vec<u8>>)],
+) -> String {
+    let mut rollback_errors = Vec::new();
+    for (path, content) in applied.iter().rev() {
+        let result = match content {
+            Some(bytes) => config::atomic_write(path, bytes),
+            None => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("删除 {} 失败: {error}", path.display())),
+            },
+        };
+        if let Err(error) = result {
+            rollback_errors.push(format!("恢复 {} 失败: {error}", path.display()));
+        }
+    }
+    if rollback_errors.is_empty() {
+        format!("{original_error}；已回滚已恢复的文件")
+    } else {
+        format!(
+            "{original_error}；文件恢复回滚失败: {}",
+            rollback_errors.join("；")
+        )
+    }
 }
 
 // ---------- Claude ----------
@@ -227,24 +280,21 @@ fn read_codex_live() -> (Option<Value>, Option<String>) {
 fn write_codex_live(auth: &Value, config_text: &str, backup: bool) -> Result<(), String> {
     let auth_path = config::get_codex_auth_path();
     let cfg_path = config::get_codex_config_path();
+    let before = snapshot_app("codex")?;
     if backup {
         backup_file(&auth_path, "codex-auth");
         backup_file(&cfg_path, "codex-config");
     }
 
-    let old_auth = fs::read(&auth_path).ok();
-    config::write_json_file(&auth_path, auth)?;
-
-    if let Err(e) = config::write_text_file(&cfg_path, config_text) {
-        match old_auth {
-            Some(bytes) => {
-                let _ = config::atomic_write(&auth_path, &bytes);
-            }
-            None => {
-                let _ = fs::remove_file(&auth_path);
-            }
-        }
-        return Err(format!("写入 config.toml 失败，已回滚 auth.json：{e}"));
+    let result = config::write_json_file(&auth_path, auth)
+        .and_then(|()| config::write_text_file(&cfg_path, config_text));
+    if let Err(error) = result {
+        return match restore_snapshot(&before) {
+            Ok(()) => Err(format!("写入 Codex 配置失败，已回滚本次部分修改：{error}")),
+            Err(rollback_error) => Err(format!(
+                "写入 Codex 配置失败，回滚也失败: {error}; {rollback_error}"
+            )),
+        };
     }
     Ok(())
 }
@@ -272,9 +322,22 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
 
     let mut result = Vec::new();
     let mut skip_provider_table = false;
+    let mut current_section = None;
+    let mut in_array_table = false;
     for line in config_text.lines() {
         let trimmed = line.trim();
+        if crate::store::is_toml_array_section(trimmed) {
+            // An array-of-tables starts a new context. Do not carry the
+            // selected provider's skip state into unrelated array entries.
+            current_section = None;
+            in_array_table = true;
+            skip_provider_table = false;
+            result.push(line);
+            continue;
+        }
         if let Some(section) = crate::store::normalized_toml_section(trimmed) {
+            current_section = Some(section.clone());
+            in_array_table = false;
             skip_provider_table = provider_id.as_ref().is_some_and(|id| {
                 let provider_section = format!("model_providers.{id}");
                 section == provider_section || section.starts_with(&(provider_section + "."))
@@ -286,7 +349,7 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
         if skip_provider_table {
             continue;
         }
-        if model_provider_value(trimmed).is_some() {
+        if !in_array_table && current_section.is_none() && model_provider_value(trimmed).is_some() {
             continue;
         }
         result.push(line);
@@ -425,7 +488,7 @@ pub fn backfill(app: &str, provider: &mut Provider) {
                     if ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
                         .iter()
                         .filter_map(|field| env.get(*field).and_then(Value::as_str))
-                        .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+                        .any(crate::proxy::is_placeholder_key)
                     {
                         return;
                     }
@@ -447,7 +510,7 @@ pub fn backfill(app: &str, provider: &mut Provider) {
                     .as_ref()
                     .and_then(|value| value.get("OPENAI_API_KEY"))
                     .and_then(Value::as_str)
-                    .is_some_and(|key| key == crate::proxy::PLACEHOLDER_KEY);
+                    .is_some_and(crate::proxy::is_placeholder_key);
                 if !auth_is_placeholder && proxy_port("codex").is_none() {
                     if let Err(error) = crate::official::capture_codex_current() {
                         eprintln!("[z-switch] 保存 Codex 官方登录态失败：{error}");
@@ -457,7 +520,7 @@ pub fn backfill(app: &str, provider: &mut Provider) {
             } else {
                 if let Some(auth_val) = &auth {
                     if let Some(key) = auth_val.get("OPENAI_API_KEY").and_then(Value::as_str) {
-                        if key == crate::proxy::PLACEHOLDER_KEY {
+                        if crate::proxy::is_placeholder_key(key) {
                             return;
                         }
                     }
@@ -495,7 +558,7 @@ pub fn backfill(app: &str, provider: &mut Provider) {
                         crate::store::extract_grok_endpoint_string(&cfg, key)
                             .or_else(|| crate::store::extract_grok_model_string(&cfg, key))
                     })
-                    .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+                    .any(|key| crate::proxy::is_placeholder_key(&key))
                 {
                     return;
                 }
@@ -546,6 +609,41 @@ pub fn proxy_port(app: &str) -> Option<u16> {
     proxy_port_from_base(app, &base)
 }
 
+/// 从操作前的 live 快照识别 z-switch 自己写入的代理端口。
+///
+/// 回滚时不能直接把快照写回：如果代理在操作期间已经退出，写回
+/// `127.0.0.1:<port>/<app>` 会让客户端继续指向失效地址。这里读取快照
+/// 本身，而不是当前磁盘文件，避免回滚判断被中间写入的内容污染。
+pub fn snapshot_proxy_port(snapshot: &AppLiveSnapshot, app: &str) -> Option<u16> {
+    let base = match app {
+        "claude" => snapshot.files.iter().find_map(|file| {
+            (file.path == config::get_claude_settings_path()).then(|| {
+                let value = serde_json::from_slice::<Value>(file.content.as_ref()?).ok()?;
+                value
+                    .get("env")
+                    .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })?
+        }),
+        "codex" => snapshot.files.iter().find_map(|file| {
+            (file.path == config::get_codex_config_path()).then(|| {
+                let content = String::from_utf8(file.content.as_ref()?.clone()).ok()?;
+                crate::store::extract_codex_provider_string(&content, "base_url")
+            })?
+        }),
+        "grok" => snapshot.files.iter().find_map(|file| {
+            (file.path == config::get_grok_config_path()).then(|| {
+                let content = String::from_utf8(file.content.as_ref()?.clone()).ok()?;
+                crate::store::extract_grok_endpoint_string(&content, "models_base_url")
+                    .or_else(|| crate::store::extract_grok_endpoint_string(&content, "base_url"))
+            })?
+        }),
+        _ => None,
+    }?;
+    proxy_port_from_base(app, &base)
+}
+
 fn proxy_port_from_base(app: &str, base: &str) -> Option<u16> {
     let url = reqwest::Url::parse(base).ok()?;
     if !crate::repair::is_localhost(url.as_str()) {
@@ -574,7 +672,7 @@ pub fn import_claude() -> Option<Provider> {
     if ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
         .iter()
         .filter_map(|field| env_obj.get(*field).and_then(Value::as_str))
-        .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+        .any(crate::proxy::is_placeholder_key)
     {
         return None;
     }
@@ -603,7 +701,7 @@ pub fn import_codex() -> Option<Provider> {
     })?;
     if let Some(auth_val) = &auth {
         if let Some(key) = auth_val.get("OPENAI_API_KEY").and_then(Value::as_str) {
-            if key == crate::proxy::PLACEHOLDER_KEY {
+            if crate::proxy::is_placeholder_key(key) {
                 return None;
             }
         }
@@ -647,7 +745,7 @@ pub fn import_grok() -> Option<Provider> {
             crate::store::extract_grok_endpoint_string(&cfg, key)
                 .or_else(|| crate::store::extract_grok_model_string(&cfg, key))
         })
-        .any(|key| key == crate::proxy::PLACEHOLDER_KEY)
+        .any(|key| crate::proxy::is_placeholder_key(&key))
     {
         return None;
     }
@@ -687,6 +785,53 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_proxy_port_reads_cli_routes_without_touching_disk() {
+        let claude_snapshot = AppLiveSnapshot {
+            files: vec![LiveFileSnapshot {
+                path: config::get_claude_settings_path(),
+                content: Some(
+                    br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9123/claude"}}"#.to_vec(),
+                ),
+            }],
+        };
+        assert_eq!(snapshot_proxy_port(&claude_snapshot, "claude"), Some(9123));
+
+        let codex_snapshot = AppLiveSnapshot {
+            files: vec![LiveFileSnapshot {
+                path: config::get_codex_config_path(),
+                content: Some(
+                    b"model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"http://localhost:9234/codex\"\n"
+                        .to_vec(),
+                ),
+            }],
+        };
+        assert_eq!(snapshot_proxy_port(&codex_snapshot, "codex"), Some(9234));
+
+        let grok_snapshot = AppLiveSnapshot {
+            files: vec![LiveFileSnapshot {
+                path: config::get_grok_config_path(),
+                content: Some(
+                    b"[endpoints]\nmodels_base_url = \"http://127.0.0.1:9345/grok\"\n".to_vec(),
+                ),
+            }],
+        };
+        assert_eq!(snapshot_proxy_port(&grok_snapshot, "grok"), Some(9345));
+    }
+
+    #[test]
+    fn snapshot_proxy_port_rejects_non_cli_localhost_urls() {
+        let snapshot = AppLiveSnapshot {
+            files: vec![LiveFileSnapshot {
+                path: config::get_claude_settings_path(),
+                content: Some(
+                    br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9123/v1"}}"#.to_vec(),
+                ),
+            }],
+        };
+        assert_eq!(snapshot_proxy_port(&snapshot, "claude"), None);
+    }
+
+    #[test]
     fn official_codex_config_removes_commented_provider_table() {
         let input = r#"model_provider = "custom" # selected relay
 model = "gpt-5"
@@ -708,6 +853,26 @@ command = "docs"
     }
 
     #[test]
+    fn official_codex_sanitizing_preserves_unrelated_array_tables() {
+        let input = r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://relay.example/v1"
+
+[[mcp_servers.docs]]
+model_provider = "docs-provider"
+base_url = "https://docs.example"
+"#;
+
+        let output = sanitize_codex_official_config(input);
+        assert!(!output.contains("model_provider = \"custom\""));
+        assert!(!output.contains("relay.example"));
+        assert!(output.contains("[[mcp_servers.docs]]"));
+        assert!(output.contains("model_provider = \"docs-provider\""));
+        assert!(output.contains("base_url = \"https://docs.example\""));
+    }
+
+    #[test]
     fn pruning_backups_keeps_non_backup_files() {
         let dir = std::env::temp_dir().join(format!(
             "z_switch_backup_test_{}_{}",
@@ -718,8 +883,9 @@ command = "docs"
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("first.bak"), b"1").unwrap();
-        fs::write(dir.join("second.bak"), b"2").unwrap();
+        fs::write(dir.join("claude-settings-1.bak"), b"1").unwrap();
+        fs::write(dir.join("claude-settings-2.bak"), b"2").unwrap();
+        fs::write(dir.join("manual.bak"), b"keep").unwrap();
         fs::write(dir.join("manual.txt"), b"keep").unwrap();
 
         prune_old_backups(&dir, 1);
@@ -727,10 +893,51 @@ command = "docs"
         let backups = fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bak"))
+            .filter(|entry| {
+                entry
+                    .path()
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.starts_with("claude-settings-"))
+            })
             .count();
         assert_eq!(backups, 1);
+        assert_eq!(fs::read(dir.join("manual.bak")).unwrap(), b"keep");
         assert_eq!(fs::read(dir.join("manual.txt")).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_snapshot_rolls_back_previous_files_after_later_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "z_switch_restore_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.json");
+        fs::write(&first, b"before").unwrap();
+        let second = dir.join("second.toml");
+        fs::create_dir(&second).unwrap();
+
+        let snapshot = AppLiveSnapshot {
+            files: vec![
+                LiveFileSnapshot {
+                    path: first.clone(),
+                    content: Some(b"after".to_vec()),
+                },
+                LiveFileSnapshot {
+                    path: second,
+                    content: None,
+                },
+            ],
+        };
+
+        assert!(restore_snapshot(&snapshot).is_err());
+        assert_eq!(fs::read(&first).unwrap(), b"before");
         let _ = fs::remove_dir_all(dir);
     }
 }
