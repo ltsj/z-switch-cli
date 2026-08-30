@@ -390,6 +390,31 @@ pub async fn is_port_open(port: u16) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
+/// 检查 TCP 端口是否已经可以重新绑定。
+///
+/// 健康接口停止响应时，代理可能仍在优雅处理已有的 SSE 连接；反过来，
+/// 也可能是其它本地程序占用了端口但没有提供健康接口。因此停机完成与否
+/// 不能只看 HTTP 探测，必须以实际绑定结果为准。
+pub(crate) async fn is_port_bindable(port: u16) -> bool {
+    validate_port(port).is_ok()
+        && tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .is_ok()
+}
+
+async fn wait_for_port_bindable(port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if is_port_bindable(port).await {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// 返回当前应用是否正在被一个已监听、且不是当前 CLI 代理的本地端口接管。
 ///
 /// GUI 默认使用 8899，而 CLI 默认使用 8999。共享 live 配置意味着同一个
@@ -519,7 +544,7 @@ pub(crate) async fn stop_locked(port: u16) -> Result<(), String> {
         Err(error) => {
             // 健康接口不可用不等于端口已经关闭。这里可能是 GUI、旧版代理
             // 或任意其它本地服务；没有 CLI PID 文件时也不能误报“已停止”。
-            if is_port_open(port).await {
+            if !is_port_bindable(port).await {
                 return Err(format!(
                     "端口 {port} 仍被其它进程或不兼容的代理占用，无法确认归属，未执行停止: {error}"
                 ));
@@ -554,11 +579,11 @@ pub(crate) async fn stop_locked(port: u16) -> Result<(), String> {
     // 等待退出
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(3) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if !is_running(port).await {
+        if is_port_bindable(port).await {
             remove_owned_pid_file(port, target_pid);
             return Ok(());
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // 强杀兜底：在真正执行前再次确认健康接口、PID 文件和管理 token。
@@ -568,7 +593,7 @@ pub(crate) async fn stop_locked(port: u16) -> Result<(), String> {
         _ => false,
     };
     if !still_owned {
-        if is_port_open(port).await {
+        if !is_port_bindable(port).await {
             return Err(format!(
                 "代理优雅停机超时，但无法再次确认端口 {port} 的进程归属，未执行强杀"
             ));
@@ -590,15 +615,14 @@ pub(crate) async fn stop_locked(port: u16) -> Result<(), String> {
                 .args(["-9", &info.pid.to_string()])
                 .output();
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        if is_running(port).await {
+        if !wait_for_port_bindable(port, Duration::from_secs(2)).await {
             return Err(format!("代理进程 {} 未能退出", info.pid));
         }
         remove_owned_pid_file(port, target_pid);
         return Ok(());
     }
 
-    if is_running(port).await {
+    if !is_port_bindable(port).await {
         return Err("代理未在优雅停机后退出，且缺少匹配的 PID 文件，未执行强杀".into());
     }
     remove_owned_pid_file(port, target_pid);
@@ -693,6 +717,18 @@ mod tests {
         assert!(is_port_open(port).await);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn port_is_not_bindable_while_listener_is_alive() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("test address").port();
+
+        assert!(!is_port_bindable(port).await);
+        drop(listener);
+        assert!(is_port_bindable(port).await);
     }
 
     #[test]

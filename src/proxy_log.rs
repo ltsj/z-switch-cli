@@ -69,8 +69,7 @@ pub fn redact_and_truncate(raw: &str, secrets: &[String]) -> String {
 
 pub fn append(entry: &ProxyErrorEntry<'_>, max_mb: u64) -> Result<(), String> {
     let dir = log_dir();
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("创建路由日志目录 {} 失败：{error}", dir.display()))?;
+    config::ensure_private_dir(&dir)?;
     let path = log_path();
     let max_bytes = max_mb.clamp(1, 100) * 1024 * 1024;
     let mut line = serde_json::to_string(entry).map_err(|error| error.to_string())?;

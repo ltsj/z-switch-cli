@@ -54,6 +54,7 @@ fn secure_permissions(path: &std::path::Path) {
 
 fn save_auth(auth: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(auth).map_err(|error| error.to_string())?;
+    config::ensure_private_dir(&config::get_official_account_dir())?;
     let path = codex_snapshot_path();
     config::atomic_write(&path, &bytes)?;
     secure_permissions(&path);

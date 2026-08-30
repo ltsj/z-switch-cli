@@ -74,6 +74,7 @@ fn to_status(manifest: &Manifest) -> OriginalConfigStatus {
 
 /// 仅在快照不存在时创建一次。
 pub fn capture_once() -> Result<bool, String> {
+    config::ensure_private_dir(&dir())?;
     if manifest_path().exists() {
         load_manifest()?;
         return Ok(false);
@@ -120,6 +121,7 @@ pub fn capture_grok_if_missing() -> Result<(), String> {
     if crate::live::proxy_port("grok").is_some() || snapshot.key_is_placeholder {
         return Err("Grok 当前仍处于本地代理占用状态，已延迟保存原始配置快照".into());
     }
+    config::ensure_private_dir(&dir())?;
     manifest.grok_config_existed =
         capture_file(&config::get_grok_config_path(), "grok-config.toml")?;
     manifest.grok_captured = true;

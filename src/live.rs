@@ -50,7 +50,7 @@ pub fn backup_file(path: &Path, tag: &str) {
         return;
     }
     let dir = config::get_app_config_dir().join("backups");
-    if fs::create_dir_all(&dir).is_err() {
+    if config::ensure_private_dir(&dir).is_err() {
         return;
     }
     let ts = std::time::SystemTime::now()
@@ -58,7 +58,13 @@ pub fn backup_file(path: &Path, tag: &str) {
         .unwrap_or_default()
         .as_nanos();
     let dest = dir.join(format!("{tag}-{ts}.bak"));
-    let _ = fs::copy(path, dest);
+    if fs::copy(path, &dest).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o600));
+        }
+    }
     prune_old_backups(&dir, 60);
 }
 

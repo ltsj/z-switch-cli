@@ -92,6 +92,22 @@ pub fn get_grok_config_path() -> PathBuf {
     get_home_dir().join(".grok").join("config.toml")
 }
 
+/// 创建仅当前用户可访问的 z-switch 数据目录。
+///
+/// 这些目录可能保存 API Key、登录令牌或包含请求上下文的错误日志；
+/// Unix 上不能依赖用户的 umask 来保证已有目录的权限足够严格。
+pub fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("创建私有数据目录 {} 失败: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("设置私有数据目录 {} 权限失败: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// 递归按字母排序对象的键，保证序列化输出确定性。
 fn sort_json_keys(value: &Value) -> Value {
     match value {
@@ -161,9 +177,16 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
         let mut f = options
             .open(&tmp)
             .map_err(|e| format!("创建临时文件失败: {e}"))?;
-        f.write_all(data)
-            .map_err(|e| format!("写入临时文件失败: {e}"))?;
-        f.flush().map_err(|e| format!("flush 失败: {e}"))?;
+        if let Err(error) = f.write_all(data) {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("写入临时文件失败: {error}"));
+        }
+        if let Err(error) = f.flush() {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("flush 失败: {error}"));
+        }
     }
 
     #[cfg(windows)]
@@ -271,6 +294,59 @@ mod tests {
         assert!(res.is_ok());
         let read = fs::read(&file).unwrap();
         assert_eq!(read, content);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_data_directories_are_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "z_switch_private_dir_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_private_dir(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn atomic_write_removes_temporary_file_when_replace_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "z_switch_atomic_failure_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+
+        assert!(atomic_write(&target, b"secret").is_err());
+        let temporary_files = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("target.tmp.")
+            })
+            .count();
+        assert_eq!(temporary_files, 0);
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -111,10 +111,23 @@ pub fn extract_codex_provider_string(config_text: &str, key: &str) -> Option<Str
     if let Ok(document) = config_text.parse::<toml::Value>() {
         let root = document.as_table()?;
         if let Some(selected) = selected.as_deref() {
-            return root
+            if let Some(provider) = root
                 .get("model_providers")
                 .and_then(|providers| providers.get(selected))
-                .and_then(|provider| provider.get(key))
+            {
+                return provider
+                    .get(key)
+                    .and_then(toml::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string);
+            }
+
+            // Older Codex configs can select a provider while keeping its
+            // fields at the document root. Only use the root fallback when
+            // the selected provider table is absent; never borrow a value
+            // from an incomplete selected table or another provider.
+            return root
+                .get(key)
                 .and_then(toml::Value::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_string);
@@ -124,10 +137,54 @@ pub fn extract_codex_provider_string(config_text: &str, key: &str) -> Option<Str
     // 没有选择 provider 时，兼容旧配置里的根级字段或第一个可见字段。
     // 一旦存在明确的 model_provider，上面的分支已经返回 None；不能在这里
     // 递归到其它 provider，否则会把未选中的中转地址/协议借给当前配置。
-    if selected.is_some() {
-        return None;
+    if let Some(selected) = selected.as_deref() {
+        if codex_provider_section_exists(config_text, selected) {
+            return None;
+        }
+        return extract_root_toml_string(config_text, key);
     }
     extract_toml_string(config_text, key)
+}
+
+fn extract_root_toml_string(config_text: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    config_text.lines().find_map(|line| {
+        if is_toml_array_section(line) {
+            in_section = true;
+            return None;
+        }
+        if normalized_toml_section(line).is_some() {
+            in_section = true;
+            return None;
+        }
+        if in_section {
+            return None;
+        }
+        let (raw_key, raw_value) = line.trim().split_once('=')?;
+        (raw_key.trim() == key)
+            .then(|| parse_toml_string_value(raw_value))
+            .flatten()
+    })
+}
+
+/// 判断 Codex 选中的 provider 是否有对应的嵌套表。
+///
+/// 该信息用于区分“嵌套表字段缺失”和“旧版根级配置”，两者不能使用
+/// 相同的回退策略。
+pub fn codex_provider_section_exists(config_text: &str, provider: &str) -> bool {
+    let wanted = format!("model_providers.{provider}");
+    if let Ok(document) = config_text.parse::<toml::Value>() {
+        return document
+            .as_table()
+            .and_then(|root| root.get("model_providers"))
+            .and_then(toml::Value::as_table)
+            .is_some_and(|providers| providers.contains_key(provider));
+    }
+    config_text.lines().any(|line| {
+        normalized_toml_section(line).is_some_and(|section| {
+            section == wanted || section.starts_with(&(wanted.clone() + "."))
+        })
+    })
 }
 
 /// Read Codex's selected provider id from the document root only.
@@ -1794,6 +1851,28 @@ wire_api = "responses"
             extract_codex_provider_string(config, "wire_api").as_deref(),
             Some("responses")
         );
+    }
+
+    #[test]
+    fn codex_extraction_supports_legacy_root_fields_with_selected_provider() {
+        let config = r#"model_provider = "custom"
+model = "gpt-4"
+base_url = "https://legacy.example/v1"
+wire_api = "responses"
+
+[mcp_servers.docs]
+base_url = "https://docs.example"
+"#;
+
+        assert_eq!(
+            extract_codex_provider_string(config, "base_url").as_deref(),
+            Some("https://legacy.example/v1")
+        );
+        assert_eq!(
+            extract_codex_provider_string(config, "wire_api").as_deref(),
+            Some("responses")
+        );
+        assert!(!codex_provider_section_exists(config, "custom"));
     }
 
     #[test]

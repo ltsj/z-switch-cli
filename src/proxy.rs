@@ -467,12 +467,13 @@ async fn admin_switch(
         return Err(StatusCode::BAD_REQUEST);
     }
     if let Some(target) = payload.target.as_ref() {
+        let normalized_base_url = target.base_url.trim();
         let parsed =
-            reqwest::Url::parse(target.base_url.trim()).map_err(|_| StatusCode::BAD_REQUEST)?;
+            reqwest::Url::parse(normalized_base_url).map_err(|_| StatusCode::BAD_REQUEST)?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(StatusCode::BAD_REQUEST);
         }
-        if is_self_proxy_target(&target.base_url, rt.port) {
+        if is_self_proxy_target(normalized_base_url, rt.port) {
             return Err(StatusCode::BAD_REQUEST);
         }
         for (name, value) in &target.headers {
@@ -484,8 +485,9 @@ async fn admin_switch(
             }
         }
     }
-    let base_url = if let Some(target) = payload.target {
-        let b = target.base_url.clone();
+    let base_url = if let Some(mut target) = payload.target {
+        let b = target.base_url.trim().to_string();
+        target.base_url = b.clone();
         set_target(&rt.targets, &app, target);
         Some(b)
     } else {
@@ -1209,8 +1211,14 @@ fn rewrite_codex_base_url(config_text: &str, local: &str) -> String {
     if let Some(provider) = crate::store::extract_codex_provider_id(config_text)
         .filter(|value| !value.trim().is_empty())
     {
-        let section = format!("model_providers.{provider}");
-        rewrite_toml_keys_in_section(config_text, &section, &[("base_url", local)])
+        if crate::store::codex_provider_section_exists(config_text, &provider) {
+            let section = format!("model_providers.{provider}");
+            rewrite_toml_keys_in_section(config_text, &section, &[("base_url", local)])
+        } else {
+            // Legacy Codex configs may select a provider but keep base_url at
+            // the document root. The extractor uses the same distinction.
+            rewrite_toml_keys_in_section(config_text, "", &[("base_url", local)])
+        }
     } else {
         // Older Codex configs may keep base_url at the document root instead
         // of under model_providers.<id>. target_from_provider accepts that
@@ -1558,6 +1566,21 @@ base_url = "https://docs.example"
     }
 
     #[test]
+    fn codex_proxy_rewrite_supports_selected_legacy_root_base_url() {
+        let config = r#"model_provider = "custom"
+model = "gpt-4"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+
+[mcp_servers.docs]
+base_url = "https://docs.example"
+"#;
+        let rewritten = rewrite_codex_base_url(config, "http://127.0.0.1:8999/codex");
+        assert!(rewritten.contains("base_url = \"http://127.0.0.1:8999/codex\""));
+        assert!(rewritten.contains("base_url = \"https://docs.example\""));
+    }
+
+    #[test]
     fn codex_proxy_rewrite_does_not_touch_array_table_fields() {
         let config = r#"model_provider = "custom"
 
@@ -1669,6 +1692,39 @@ base_url = "https://array.example"
         headers.insert("x-z-switch-admin-token", "wrong".parse().unwrap());
         assert!(!authorized(&headers, &runtime_for_test("correct")));
         assert!(!authorized(&HeaderMap::new(), &runtime_for_test("correct")));
+    }
+
+    #[tokio::test]
+    async fn admin_switch_normalizes_base_url_before_storing_target() {
+        let runtime = Arc::new(runtime_for_test("correct"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-z-switch-admin-token", "correct".parse().unwrap());
+        let request = AdminSwitchRequest {
+            app: "claude".into(),
+            target: Some(AppTarget {
+                base_url: "  https://provider.example/v1  ".into(),
+                headers: Vec::new(),
+            }),
+        };
+
+        let response = admin_switch(State(runtime.clone()), headers, Json(request))
+            .await
+            .expect("admin switch should accept surrounding whitespace");
+        assert_eq!(
+            response.0.base_url.as_deref(),
+            Some("https://provider.example/v1")
+        );
+        assert_eq!(
+            runtime
+                .targets
+                .read()
+                .unwrap()
+                .map
+                .get("claude")
+                .unwrap()
+                .base_url,
+            "https://provider.example/v1"
+        );
     }
 
     #[test]
