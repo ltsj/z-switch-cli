@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 pub const PROFILE_ID: &str = "00000000-0000-4000-8000-007a53000001";
 pub const PROFILE_NAME: &str = "z-switch";
 
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", windows))]
 const CONFIG_FILE: &str = "claude_desktop_config.json";
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", windows))]
 const CONFIG_LIBRARY_DIR: &str = "configLibrary";
 
 const GATEWAY_TOKEN: &str = "z-switch-desktop";
@@ -348,7 +348,7 @@ fn pick_windows_claude_dir(local_app_data: &Path, threep: bool) -> Option<PathBu
     candidates.into_iter().next()
 }
 
-#[cfg(any(target_os = "macos", windows, test))]
+#[cfg(any(target_os = "macos", windows))]
 fn paths_from_dirs(normal_dir: PathBuf, threep_dir: PathBuf) -> Paths {
     let library = threep_dir.join(CONFIG_LIBRARY_DIR);
     Paths {
