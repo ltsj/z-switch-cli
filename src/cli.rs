@@ -14,7 +14,9 @@ pub struct Cli {
     pub command: Option<Commands>,
 
     /// 指定目标应用（claude、codex、grok）
-    #[arg(short, long, global = true, value_enum)]
+    // 顶层参数和子命令参数分别接收 --app，不能标记为 global，否则 Clap
+    // 会把同名参数继承到子命令并报重复定义。
+    #[arg(short, long, value_enum)]
     pub app: Option<AppType>,
 }
 
@@ -47,8 +49,8 @@ pub enum Commands {
     #[command(alias = "ls")]
     List {
         /// 仅列出指定应用的供应商
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
     },
 
     /// 切换供应商（支持模糊匹配名称或 ID）
@@ -58,8 +60,8 @@ pub enum Commands {
         query: Option<String>,
 
         /// 目标应用（默认为 claude）
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 强制使用本地代理热切模式
         #[arg(long, conflicts_with = "direct")]
@@ -80,8 +82,8 @@ pub enum Commands {
         query: Option<String>,
 
         /// 目标应用
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 进行真实流式对话首字延时 (TTFT) 测速
         #[arg(
@@ -101,8 +103,8 @@ pub enum Commands {
     /// 新增供应商
     Add {
         /// 目标应用
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 供应商显示名称
         #[arg(short, long)]
@@ -135,8 +137,8 @@ pub enum Commands {
         query: Option<String>,
 
         /// 目标应用
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 修改显示名称
         #[arg(short, long)]
@@ -166,8 +168,8 @@ pub enum Commands {
         query: Option<String>,
 
         /// 目标应用
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 若当前供应商正在使用中的处理方式 (keep 保留配置 / restore 恢复官方基线)
         #[arg(long)]
@@ -200,8 +202,8 @@ pub enum Commands {
     /// 恢复官方基线配置
     Restore {
         /// 目标应用
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 本地代理端口（未指定时从当前 live 配置识别，默认 8999）
         #[arg(long)]
@@ -214,8 +216,8 @@ pub enum Commands {
     /// 修复本地残留占位配置或环境异常
     Repair {
         /// 目标应用
-        #[arg(short, long, value_enum)]
-        app: Option<AppType>,
+        #[arg(short = 'a', long = "app", value_enum)]
+        target_app: Option<AppType>,
 
         /// 本地代理端口（未指定时从当前 live 配置识别，默认 8999）
         #[arg(long)]
@@ -230,6 +232,55 @@ pub enum Commands {
         /// 设置的值（true / false）
         value: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppType, Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn subcommands_accept_app_option_after_subcommand() {
+        let list =
+            Cli::try_parse_from(["z-switch", "list", "--app", "claude"]).expect("list app option");
+        assert!(matches!(
+            list.command,
+            Some(Commands::List {
+                target_app: Some(AppType::Claude)
+            })
+        ));
+
+        let use_command = Cli::try_parse_from(["z-switch", "use", "deepseek", "--app", "claude"])
+            .expect("use app option");
+        assert!(matches!(
+            use_command.command,
+            Some(Commands::Use {
+                target_app: Some(AppType::Claude),
+                ..
+            })
+        ));
+
+        let test =
+            Cli::try_parse_from(["z-switch", "test", "--app", "codex"]).expect("test app option");
+        assert!(matches!(
+            test.command,
+            Some(Commands::Test {
+                target_app: Some(AppType::Codex),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn global_app_option_remains_supported_before_subcommand() {
+        let parsed = Cli::try_parse_from(["z-switch", "--app", "claude", "list"])
+            .expect("global app option");
+        assert_eq!(parsed.app, Some(AppType::Claude));
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::List { target_app: None })
+        ));
+    }
 }
 
 #[derive(Subcommand, Debug)]

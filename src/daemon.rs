@@ -57,11 +57,9 @@ impl Drop for LifecycleLock {
 
 pub(crate) async fn acquire_lifecycle_lock(port: u16) -> Result<LifecycleLock, String> {
     let path = start_lock_path_for(port);
-    let parent = path
-        .parent()
+    path.parent()
         .ok_or_else(|| "无效的代理启动锁路径".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("创建代理启动锁目录 {} 失败: {error}", parent.display()))?;
+    config::ensure_app_config_dir()?;
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -164,9 +162,7 @@ pub fn read_pid_file(port: u16) -> Option<PidInfo> {
 pub fn write_pid_file(port: u16, admin_token: &str) -> Result<(), String> {
     validate_port(port)?;
     let path = pid_file_path_for(port);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
+    config::ensure_app_config_dir()?;
     let info = PidInfo {
         pid: std::process::id(),
         port,
@@ -501,6 +497,7 @@ async fn start_background_locked_owned(port: u16) -> Result<StartOutcome, String
         }
         if let Ok(health) = check_health(port).await {
             let ready = health.port == port
+                && health.pid == child.id()
                 && read_pid_file(port).is_some_and(|info| info.pid == health.pid);
             if ready {
                 return Ok(StartOutcome {

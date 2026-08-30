@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 use crate::claude_desktop;
 use crate::claude_ext;
+use crate::config;
 use crate::daemon;
 use crate::live;
 use crate::official;
@@ -19,10 +20,53 @@ const BOOL_SETTING_KEYS: &[&str] = &[
     "applyClaudeDesktop",
 ];
 
+/// GUI 版本 z-switch 的默认代理端口。CLI 的自动端口选择不能因为
+/// live 配置残留而重新占用这个端口；只有用户显式传入 --port 才允许使用。
+const GUI_DEFAULT_PORT: u16 = 8899;
+
 fn active_foreign_proxy_error(app: &str, port: u16, foreign_port: u16) -> String {
     format!(
         "{app} 当前由其它本地代理 127.0.0.1:{foreign_port} 接管，未覆盖 live 配置；请先停止该代理，或明确使用 --proxy --port {port} 接管"
     )
+}
+
+fn may_take_over_foreign_proxy(
+    proxy_mode: Option<bool>,
+    requested_port: Option<u16>,
+    selected_port: u16,
+    foreign_port: u16,
+) -> bool {
+    proxy_mode == Some(true)
+        && selected_port != foreign_port
+        && (requested_port.is_some()
+            || (foreign_port == GUI_DEFAULT_PORT && selected_port == proxy::DEFAULT_PORT))
+}
+
+fn select_switch_port(
+    requested_port: Option<u16>,
+    preferred_port: Option<u16>,
+    proxy_mode: Option<bool>,
+    preferred_is_open: bool,
+    preferred_cli_running: bool,
+) -> u16 {
+    if let Some(port) = requested_port {
+        return port;
+    }
+
+    if proxy_mode == Some(true)
+        && preferred_port.is_some_and(|port| {
+            (port == GUI_DEFAULT_PORT || (port != proxy::DEFAULT_PORT && preferred_is_open))
+                && !preferred_cli_running
+        })
+    {
+        return proxy::DEFAULT_PORT;
+    }
+
+    preferred_port.unwrap_or(proxy::DEFAULT_PORT)
+}
+
+fn app_route_is_active(live_route_matches: bool, daemon_alive: bool, runtime_routed: bool) -> bool {
+    live_route_matches && (runtime_routed || !daemon_alive)
 }
 
 fn validate_provider(app: &str, provider: &Provider) -> Result<(), String> {
@@ -120,24 +164,10 @@ pub struct SwitchService {
 
 impl SwitchService {
     pub fn new() -> Self {
-        if let Err(e) = official::capture_codex_if_logged_in() {
-            eprintln!("[z-switch] 初始化 Codex 官方登录态警告: {e}");
-        }
-
-        let snapshot_ready = match original::capture_once() {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!("[z-switch] 保存本机原始配置警告: {e}");
-                false
-            }
-        };
-
-        if let Err(e) = original::capture_grok_if_missing() {
-            eprintln!("[z-switch] 补采 Grok 原始配置警告: {e}");
-        }
-
-        // 启动迁移必须持有 StoreSession 直到提交完成，否则 GUI 可能在
-        // load_checked() 与 save() 之间写入新配置，随后又被 CLI 的旧快照覆盖。
+        // Acquire the shared store lock before the snapshot lock. Switching
+        // can refresh the official Codex account while it owns the store
+        // lock; using the same order here prevents startup and switching
+        // processes from waiting on each other indefinitely.
         let mut store_session = match store::StoreSession::begin() {
             Ok(session) => Some(session),
             Err(error) => {
@@ -145,6 +175,47 @@ impl SwitchService {
                 None
             }
         };
+
+        // The official-account and original-config snapshots are separate
+        // files but describe one startup state. Hold one cross-process lock
+        // across all three operations so concurrent CLI/GUI startup cannot
+        // combine files captured from different live configurations.
+        let snapshot_lock = match store_session.as_ref() {
+            Some(_) => match config::lock_snapshots() {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    eprintln!("[z-switch] 初始化快照锁失败，跳过本次快照采集: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let snapshot_ready = if snapshot_lock.is_some() {
+            if let Err(e) = official::capture_codex_if_logged_in() {
+                eprintln!("[z-switch] 初始化 Codex 官方登录态警告: {e}");
+            }
+
+            match original::capture_once() {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[z-switch] 保存本机原始配置警告: {e}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if snapshot_lock.is_some() {
+            if let Err(e) = original::capture_grok_if_missing() {
+                eprintln!("[z-switch] 补采 Grok 原始配置警告: {e}");
+            }
+        }
+        drop(snapshot_lock);
+
+        // `store_session` was acquired before the snapshot lock and remains
+        // held through migration. This keeps the startup read/modify/write
+        // sequence consistent with normal CLI changes.
         let mut root = store_session
             .as_ref()
             .map(|session| session.root.clone())
@@ -498,27 +569,63 @@ impl SwitchService {
         app: &str,
         query: &str,
         proxy_mode: Option<bool>,
-        port: Option<u16>,
+        requested_port: Option<u16>,
     ) -> Result<(Provider, bool), String> {
-        let port = port
-            .or_else(|| daemon::preferred_port_for_app(app))
-            .unwrap_or(proxy::DEFAULT_PORT);
+        let preferred_port = daemon::preferred_port_for_app(app);
+        // If live configuration still points at a foreign proxy (for example
+        // the GUI's 8899), use the CLI default port instead of trying to bind
+        // the foreign listener. A stopped CLI on a custom port remains
+        // recoverable.
+        let preferred_is_open = if requested_port.is_none()
+            && proxy_mode == Some(true)
+            && preferred_port.is_some_and(|port| port != proxy::DEFAULT_PORT)
+        {
+            daemon::is_port_open(preferred_port.unwrap()).await
+        } else {
+            false
+        };
+        let preferred_cli_running = if preferred_is_open {
+            daemon::is_running(preferred_port.unwrap()).await
+        } else {
+            false
+        };
+        let port = select_switch_port(
+            requested_port,
+            preferred_port,
+            proxy_mode,
+            preferred_is_open,
+            preferred_cli_running,
+        );
         daemon::validate_port(port)?;
-        // 共享 live 文件只能同时指向一个代理。默认/直连模式不能静默
-        // 覆盖 GUI（默认 8899）或其它仍在监听的本地代理。
-        if proxy_mode != Some(true) {
-            if let Some(foreign_port) = daemon::active_foreign_proxy_port(app, port).await {
+        // An explicit port can move an app away from an older CLI worker.
+        // Remember only a worker that is currently authenticated as ours;
+        // the GUI and arbitrary localhost services must never be stopped here.
+        let previous_cli_port = match preferred_port {
+            Some(previous) if previous != port && daemon::is_running(previous).await => {
+                Some(previous)
+            }
+            _ => None,
+        };
+        // 共享 live 文件只能同时指向一个代理。直连模式不能静默覆盖
+        // GUI 或其它仍在监听的本地代理；代理模式只有在目标端口本身已
+        // 被外部代理占用时拒绝，使用另一个 CLI 端口可以显式接管路由。
+        if let Some(foreign_port) = daemon::active_foreign_proxy_port(app, port).await {
+            if !may_take_over_foreign_proxy(proxy_mode, requested_port, port, foreign_port) {
                 return Err(active_foreign_proxy_error(app, port, foreign_port));
             }
         }
         let daemon_was_alive_before = daemon::is_running(port).await;
         // 代理进程可以同时服务多个应用；默认模式必须看当前 app 是否已路由，
         // 不能因为另一个 app 开着代理就意外把本 app 改成 localhost 配置。
-        let app_was_routed_before = daemon_was_alive_before
-            && daemon::get_status(port)
+        let live_route_matches = live::proxy_port(app) == Some(port);
+        let app_was_routed_before = app_route_is_active(
+            live_route_matches,
+            daemon_was_alive_before,
+            daemon::get_status(port)
                 .await
                 .ok()
-                .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app));
+                .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app)),
+        );
         let mut proxy_requested = proxy_mode.unwrap_or(app_was_routed_before);
         // 先在无锁快照上校验目标。不能持有 StoreSession 再启动 worker，
         // 因为 worker 启动时也需要读取 providers.json；但也不能在查询失败后
@@ -571,8 +678,8 @@ impl SwitchService {
         // worker, but another CLI/GUI process may change the live route while
         // this command waits for the shared store lock. Refresh the ownership
         // and routing decision under that lock before touching live files.
-        if proxy_mode != Some(true) {
-            if let Some(foreign_port) = daemon::active_foreign_proxy_port(app, port).await {
+        if let Some(foreign_port) = daemon::active_foreign_proxy_port(app, port).await {
+            if !may_take_over_foreign_proxy(proxy_mode, requested_port, port, foreign_port) {
                 drop(session);
                 stop_started_proxy(port, started_here).await;
                 return Err(active_foreign_proxy_error(app, port, foreign_port));
@@ -580,9 +687,14 @@ impl SwitchService {
         }
         let latest_status = daemon::get_status(port).await.ok();
         let mut daemon_was_alive = latest_status.is_some();
-        let mut app_was_routed = latest_status
-            .as_ref()
-            .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app));
+        let live_route_matches = live::proxy_port(app) == Some(port);
+        let mut app_was_routed = app_route_is_active(
+            live_route_matches,
+            daemon_was_alive,
+            latest_status
+                .as_ref()
+                .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app)),
+        );
         proxy_requested = proxy_mode.unwrap_or(app_was_routed);
 
         // `--proxy` is an explicit request. The worker may have been stopped
@@ -780,6 +892,7 @@ impl SwitchService {
                     eprintln!("[z-switch] 同步 Claude Desktop 代理配置失败: {error}");
                 }
             }
+            retire_previous_cli_proxy(app, previous_cli_port, Some(port)).await;
             return Ok((target, true));
         }
 
@@ -850,6 +963,7 @@ impl SwitchService {
                 eprintln!("[z-switch] 同步 Claude Desktop 直连配置失败: {error}");
             }
         }
+        retire_previous_cli_proxy(app, previous_cli_port, None).await;
         Ok((target, false))
     }
 
@@ -872,7 +986,8 @@ impl SwitchService {
         let route_active = daemon::get_status(port)
             .await
             .ok()
-            .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app));
+            .is_some_and(|status| status.routed_apps.iter().any(|routed| routed == app))
+            && live::proxy_port(app) == Some(port);
         let backup = root
             .settings
             .get("backupBeforeWrite")
@@ -1582,16 +1697,30 @@ impl SwitchService {
             None
         };
 
+        // Validate every restoration target before changing any live file.
+        // Otherwise a later missing/invalid provider could leave earlier apps
+        // on direct configuration while the old proxy is still running.
+        let managed_providers: Vec<(String, Provider)> = managed_apps
+            .iter()
+            .map(|app| {
+                let provider = root
+                    .apps
+                    .get(app)
+                    .and_then(|data| data.current.as_ref().and_then(|id| data.providers.get(id)))
+                    .cloned()
+                    .ok_or_else(|| format!("{app} 没有可恢复的当前供应商，未停止代理"))?;
+                validate_provider(app, &provider)
+                    .and_then(|()| validate_wire_api(app, &provider))
+                    .map_err(|error| format!("{app} 当前供应商不可恢复：{error}"))?;
+                Ok((app.clone(), provider))
+            })
+            .collect::<Result<_, String>>()?;
+
         let live_snapshots = managed_apps
             .iter()
             .map(|app| live::snapshot_app(app).map(|snapshot| (app.clone(), snapshot)))
             .collect::<Result<Vec<_>, String>>()?;
-        for app in &managed_apps {
-            let provider = root
-                .apps
-                .get(app)
-                .and_then(|data| data.current.as_ref().and_then(|id| data.providers.get(id)))
-                .ok_or_else(|| format!("{app} 没有可恢复的当前供应商，未停止代理"))?;
+        for (app, provider) in &managed_providers {
             if let Err(error) = live::write_live(app, provider, backup) {
                 return Err(with_live_snapshot_rollback(error, &live_snapshots));
             }
@@ -1706,6 +1835,10 @@ impl SwitchService {
                 routed_apps.push((*app).to_string());
             }
         }
+        // stop_proxy_locked() deliberately preserves an app whose live 配置
+        // 已被 GUI 或手工修改。重启后只恢复仍明确指向本端口的应用，不能
+        // 因为它曾经在内存路由表中就再次覆盖外部配置。
+        routed_apps.retain(|app| live::proxy_port(app) == Some(port));
 
         if routed_apps.is_empty() {
             daemon::stop_locked(port).await?;
@@ -1777,6 +1910,52 @@ async fn stop_started_proxy(port: u16, started_here: Option<u32>) {
     if let Some(pid) = started_here {
         if let Err(error) = daemon::stop_if_pid(port, pid).await {
             eprintln!("[z-switch] 清理本次启动的代理失败: {error}");
+        }
+    }
+}
+
+/// Remove an app route left behind when an operation moved it to another
+/// port, or from proxy mode back to direct mode. The current live file is
+/// checked before and after taking the old port's lifecycle lock so a command
+/// racing with this cleanup can safely win without having its route removed.
+async fn retire_previous_cli_proxy(
+    app: &str,
+    previous_port: Option<u16>,
+    expected_live_port: Option<u16>,
+) {
+    let Some(previous_port) = previous_port else {
+        return;
+    };
+    if live::proxy_port(app) != expected_live_port {
+        return;
+    }
+    let Ok(_lifecycle_lock) = daemon::acquire_lifecycle_lock(previous_port).await else {
+        return;
+    };
+    if live::proxy_port(app) != expected_live_port {
+        return;
+    }
+
+    let Ok(status) = daemon::get_status(previous_port).await else {
+        return;
+    };
+    if !status.routed_apps.iter().any(|routed| routed == app) {
+        return;
+    }
+    if let Err(error) = daemon::send_switch(previous_port, app, None).await {
+        eprintln!("[z-switch] 清理旧代理端口 {previous_port} 的 {app} 路由失败: {error}");
+        return;
+    }
+
+    // Reclaim an otherwise idle worker. If it still serves another app, keep
+    // it alive and only remove the route being migrated.
+    if daemon::get_status(previous_port)
+        .await
+        .ok()
+        .is_some_and(|status| status.routed_apps.is_empty())
+    {
+        if let Err(error) = daemon::stop_locked(previous_port).await {
+            eprintln!("[z-switch] 回收空闲旧代理端口 {previous_port} 失败: {error}");
         }
     }
 }
@@ -2080,5 +2259,66 @@ mod tests {
             ..grok
         };
         assert!(validate_provider("grok", &xai_auth).is_err());
+    }
+
+    #[test]
+    fn switch_port_selection_respects_explicit_and_foreign_ports() {
+        assert_eq!(
+            select_switch_port(None, Some(8899), Some(true), true, false),
+            8999
+        );
+        assert_eq!(
+            select_switch_port(None, Some(8899), Some(true), false, false),
+            8999
+        );
+        assert_eq!(
+            select_switch_port(None, Some(8997), Some(true), true, true),
+            8997
+        );
+        assert_eq!(
+            select_switch_port(None, Some(8997), Some(true), false, false),
+            8997
+        );
+        assert_eq!(
+            select_switch_port(Some(8999), Some(8899), Some(true), true, false),
+            8999
+        );
+        assert_eq!(
+            select_switch_port(None, Some(8899), None, true, false),
+            8899
+        );
+    }
+
+    #[test]
+    fn foreign_proxy_takeover_requires_an_explicit_different_proxy_port() {
+        assert!(may_take_over_foreign_proxy(Some(true), None, 8999, 8899));
+        assert!(!may_take_over_foreign_proxy(None, Some(8999), 8999, 8899));
+        assert!(!may_take_over_foreign_proxy(
+            Some(false),
+            Some(8999),
+            8999,
+            8899
+        ));
+        assert!(!may_take_over_foreign_proxy(
+            Some(true),
+            Some(8999),
+            8999,
+            8999
+        ));
+        assert!(may_take_over_foreign_proxy(
+            Some(true),
+            Some(8999),
+            8999,
+            8899
+        ));
+        assert!(!may_take_over_foreign_proxy(Some(true), None, 8999, 9876));
+    }
+
+    #[test]
+    fn stale_runtime_route_does_not_override_direct_live_config() {
+        assert!(!app_route_is_active(false, true, true));
+        assert!(!app_route_is_active(true, true, false));
+        assert!(app_route_is_active(true, true, true));
+        assert!(app_route_is_active(true, false, false));
     }
 }

@@ -1,6 +1,7 @@
 //! z-switch-cli 主程序入口。
 use clap::Parser;
 use colored::Colorize;
+use std::io::IsTerminal;
 
 mod ccswitch;
 mod claude_desktop;
@@ -56,6 +57,15 @@ fn update_claude_model(env: &mut serde_json::Map<String, serde_json::Value>, mod
     }
 }
 
+fn require_interactive_terminal() {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!(
+            "当前命令需要交互式终端；脚本或管道调用请提供供应商参数，或使用对应的非交互子命令"
+        );
+        std::process::exit(2);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -78,12 +88,13 @@ async fn main() {
 
     match cli.command {
         None => {
+            require_interactive_terminal();
             tui::run_interactive_menu(&service).await;
         }
 
-        Some(Commands::List { app }) => {
+        Some(Commands::List { target_app }) => {
             let root = service.get_root();
-            let apps: Vec<&str> = match (app, target_app_default.as_deref()) {
+            let apps: Vec<&str> = match (target_app, target_app_default.as_deref()) {
                 (Some(a), _) => vec![a.as_str()],
                 (None, Some(a)) => vec![a],
                 (None, None) => vec!["claude", "codex", "grok"],
@@ -103,12 +114,12 @@ async fn main() {
 
         Some(Commands::Use {
             query,
-            app,
+            target_app,
             proxy,
             direct,
             port,
         }) => {
-            let selected_app = app
+            let selected_app = target_app
                 .map(|a| a.as_str().to_string())
                 .or_else(|| target_app_default.clone());
             let app_name = selected_app.clone().unwrap_or_else(|| "claude".to_string());
@@ -121,19 +132,12 @@ async fn main() {
                 None
             };
 
-            // 带 provider 查询时，未显式指定 app 也使用默认 app（claude）对应
-            // 的 CLI 代理端口；纯交互模式则不能提前假定 app，因为 TUI 可能
-            // 让用户改选 codex 或 grok。
-            let interactive_port = if query.is_some() || selected_app.is_some() {
-                port.or_else(|| daemon::preferred_port_for_app(&app_name))
-            } else {
-                port
-            };
-            let effective_port = interactive_port.unwrap_or(proxy::DEFAULT_PORT);
-
             if let Some(q) = query {
                 match service
-                    .switch_async(&app_name, &q, proxy_mode, Some(effective_port))
+                    // 只把用户显式指定的端口传给 service。未指定端口时，
+                    // service 需要根据当前 live 配置判断是否应从 GUI 的
+                    // 8899 回退到 CLI 默认端口 8999。
+                    .switch_async(&app_name, &q, proxy_mode, port)
                     .await
                 {
                     Ok((p, is_proxied)) => {
@@ -150,6 +154,9 @@ async fn main() {
                             mode_str
                         );
                         if is_proxied {
+                            let effective_port = daemon::preferred_port_for_app(&app_name)
+                                .or(port)
+                                .unwrap_or(proxy::DEFAULT_PORT);
                             println!(
                                 "  {} 代理已在 127.0.0.1:{} 转发请求，无需重启终端即可生效！",
                                 "ℹ".bright_blue(),
@@ -163,11 +170,12 @@ async fn main() {
                     }
                 }
             } else {
+                require_interactive_terminal();
                 tui::interactive_switch_with_options(
                     &service,
                     selected_app.as_deref(),
                     proxy_mode,
-                    interactive_port,
+                    port,
                 )
                 .await;
             }
@@ -175,11 +183,11 @@ async fn main() {
 
         Some(Commands::Test {
             query,
-            app,
+            target_app,
             stream,
             all,
         }) => {
-            let app_name = app
+            let app_name = target_app
                 .map(|a| a.as_str().to_string())
                 .or(target_app_default)
                 .unwrap_or_else(|| "claude".to_string());
@@ -213,12 +221,13 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else {
+                require_interactive_terminal();
                 tui::interactive_test(&service).await;
             }
         }
 
         Some(Commands::Add {
-            app,
+            target_app,
             name,
             url,
             key,
@@ -226,7 +235,7 @@ async fn main() {
             model,
             wire_api,
         }) => {
-            let app_name = app
+            let app_name = target_app
                 .map(|a| a.as_str().to_string())
                 .or(target_app_default)
                 .unwrap_or_else(|| "claude".to_string());
@@ -317,20 +326,21 @@ async fn main() {
                 );
                 std::process::exit(2);
             } else {
+                require_interactive_terminal();
                 tui::interactive_add(&service).await;
             }
         }
 
         Some(Commands::Edit {
             query,
-            app,
+            target_app,
             name,
             url,
             key,
             model,
             port,
         }) => {
-            let app_name = app
+            let app_name = target_app
                 .map(|a| a.as_str().to_string())
                 .or(target_app_default)
                 .unwrap_or_else(|| "claude".to_string());
@@ -473,17 +483,18 @@ async fn main() {
                 );
                 std::process::exit(2);
             } else {
+                require_interactive_terminal();
                 tui::interactive_edit(&service).await;
             }
         }
 
         Some(Commands::Remove {
             query,
-            app,
+            target_app,
             mode,
             port,
         }) => {
-            let app_name = app
+            let app_name = target_app
                 .map(|a| a.as_str().to_string())
                 .or(target_app_default)
                 .unwrap_or_else(|| "claude".to_string());
@@ -502,6 +513,7 @@ async fn main() {
                     }
                 }
             } else {
+                require_interactive_terminal();
                 tui::interactive_remove(&service).await;
             }
         }
@@ -656,8 +668,8 @@ async fn main() {
             }
         }
 
-        Some(Commands::Restore { app, port }) => {
-            let app_name = app
+        Some(Commands::Restore { target_app, port }) => {
+            let app_name = target_app
                 .map(|a| a.as_str().to_string())
                 .or(target_app_default)
                 .unwrap_or_else(|| "claude".to_string());
@@ -680,8 +692,8 @@ async fn main() {
             }
         }
 
-        Some(Commands::Repair { app, port }) => {
-            let app_name = app
+        Some(Commands::Repair { target_app, port }) => {
+            let app_name = target_app
                 .map(|a| a.as_str().to_string())
                 .or(target_app_default)
                 .unwrap_or_else(|| "claude".to_string());

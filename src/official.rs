@@ -80,6 +80,10 @@ pub fn capture_codex_if_logged_in() -> Result<bool, String> {
 
 /// 官方账号处于当前项时，离开前保存 Codex 刚刚刷新过的登录凭据
 pub fn capture_codex_current() -> Result<(), String> {
+    // This can run while another CLI instance is taking the startup
+    // snapshots. Serialize it with that capture sequence so the official
+    // account snapshot cannot be overwritten by a mixed live state.
+    let _snapshot_lock = config::lock_snapshots()?;
     let path = config::get_codex_auth_path();
     if !path.exists() {
         let snapshot = codex_snapshot_path();
@@ -110,6 +114,17 @@ pub fn codex_auth_for_restore() -> Result<Value, String> {
     let path = codex_snapshot_path();
     if path.exists() {
         return config::read_json_file(&path);
+    }
+    // A snapshot may be unavailable on a first run or after an interrupted
+    // migration. Preserve the current OAuth/login object in that case, but
+    // never carry a third-party API key into the official account state.
+    let live_path = config::get_codex_auth_path();
+    let Ok(mut auth) = config::read_json_file::<Value>(&live_path) else {
+        return Ok(serde_json::json!({}));
+    };
+    if let Some(object) = auth.as_object_mut() {
+        object.remove("OPENAI_API_KEY");
+        return Ok(auth);
     }
     Ok(serde_json::json!({}))
 }

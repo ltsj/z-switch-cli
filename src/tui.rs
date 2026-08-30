@@ -287,10 +287,6 @@ pub async fn interactive_switch_with_options(
             return;
         }
     };
-    let port = requested_port
-        .or_else(|| crate::daemon::preferred_port_for_app(&app_choice))
-        .unwrap_or(DEFAULT_PORT);
-
     let mut provider_items = Vec::new();
     for id in &data.order {
         if let Some(p) = data.providers.get(id) {
@@ -341,7 +337,9 @@ pub async fn interactive_switch_with_options(
     spinner.enable_steady_tick(Duration::from_millis(80));
 
     match service
-        .switch_async(&app_choice, id_part, Some(mode_choice), Some(port))
+        // 未显式指定端口时交给 service 选择。这样交互模式也能在发现
+        // GUI 正占用 8899 时自动切换到 CLI 默认端口 8999。
+        .switch_async(&app_choice, id_part, Some(mode_choice), requested_port)
         .await
     {
         Ok((p, proxied)) => {
@@ -359,6 +357,9 @@ pub async fn interactive_switch_with_options(
                 mode_str
             );
             if proxied {
+                let port = crate::daemon::preferred_port_for_app(&app_choice)
+                    .or(requested_port)
+                    .unwrap_or(DEFAULT_PORT);
                 println!(
                     "  {} 代理正在 127.0.0.1:{} 转发请求，无需重启终端即可生效！",
                     "ℹ".bright_blue(),

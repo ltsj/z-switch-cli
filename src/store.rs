@@ -146,7 +146,21 @@ pub fn extract_codex_provider_string(config_text: &str, key: &str) -> Option<Str
     extract_toml_string(config_text, key)
 }
 
-fn extract_root_toml_string(config_text: &str, key: &str) -> Option<String> {
+/// Read a string from the TOML document root only.
+///
+/// This is intentionally separate from `extract_toml_string`, whose legacy
+/// fallback may search nested sections. Root-only reads are needed for fields
+/// such as Codex's selected model and legacy root `base_url`.
+pub fn extract_root_toml_string(config_text: &str, key: &str) -> Option<String> {
+    if let Ok(document) = config_text.parse::<toml::Value>() {
+        return document
+            .as_table()
+            .and_then(|root| root.get(key))
+            .and_then(toml::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+    }
+
     let mut in_section = false;
     config_text.lines().find_map(|line| {
         if is_toml_array_section(line) {
@@ -229,19 +243,23 @@ pub fn extract_codex_provider_id(config_text: &str) -> Option<String> {
 /// Read a Grok endpoint field only from the document root or `[endpoints]`.
 /// A generic recursive TOML lookup is unsafe here because model entries may
 /// contain their own `base_url` or credentials for a different model.
+fn non_empty_toml_string(value: Option<&toml::Value>) -> Option<&str> {
+    value
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
 pub fn extract_grok_endpoint_string(config_text: &str, key: &str) -> Option<String> {
     if let Ok(document) = config_text.parse::<toml::Value>() {
         let root = document.as_table()?;
-        return root
-            .get(key)
-            .and_then(toml::Value::as_str)
+        return non_empty_toml_string(root.get(key))
             .or_else(|| {
-                root.get("endpoints")
-                    .and_then(toml::Value::as_table)
-                    .and_then(|endpoints| endpoints.get(key))
-                    .and_then(toml::Value::as_str)
+                non_empty_toml_string(
+                    root.get("endpoints")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|endpoints| endpoints.get(key)),
+                )
             })
-            .filter(|value| !value.trim().is_empty())
             .map(str::to_string);
     }
 
@@ -685,15 +703,14 @@ fn extract_grok_explicit_string(
     root: &toml::map::Map<String, toml::Value>,
     key: &str,
 ) -> Option<String> {
-    root.get(key)
-        .and_then(toml::Value::as_str)
+    non_empty_toml_string(root.get(key))
         .or_else(|| {
-            root.get("endpoints")
-                .and_then(toml::Value::as_table)
-                .and_then(|endpoints| endpoints.get(key))
-                .and_then(toml::Value::as_str)
+            non_empty_toml_string(
+                root.get("endpoints")
+                    .and_then(toml::Value::as_table)
+                    .and_then(|endpoints| endpoints.get(key)),
+            )
         })
-        .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
 }
 
@@ -947,7 +964,11 @@ impl Provider {
                     .settings_config
                     .get("config")
                     .and_then(|v| v.as_str())?;
-                extract_toml_string(cfg, "model")
+                // Codex's selected model is a document-root setting. A
+                // recursive lookup could accidentally pick `model` from an
+                // MCP/provider table when a malformed or older config omits
+                // the root field.
+                extract_root_toml_string(cfg, "model")
             }
             "grok" => {
                 let cfg = self
@@ -1582,6 +1603,23 @@ wire_api = "responses"
     }
 
     #[test]
+    fn codex_model_extraction_does_not_borrow_nested_model_fields() {
+        let provider = Provider {
+            id: "codex-nested-model".into(),
+            name: "Codex nested model".into(),
+            category: Some("custom".into()),
+            settings_config: json!({
+                "auth": { "OPENAI_API_KEY": "key" },
+                "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nmodel = \"provider-model\"\n\n[mcp_servers.docs]\nmodel = \"docs-model\"\n"
+            }),
+            meta: json!({}),
+            failover: json!({}),
+        };
+
+        assert_eq!(provider.extract_model("codex"), None);
+    }
+
+    #[test]
     fn test_quote_toml_string_escapes_input() {
         assert_eq!(
             quote_toml_string("https://example.test/\"quoted\"\\path"),
@@ -1929,6 +1967,32 @@ api_key = "selected-key"
             None
         );
         assert_eq!(extract_grok_endpoint_string(config, "base_url"), None);
+    }
+
+    #[test]
+    fn grok_empty_root_values_do_not_hide_endpoint_fallbacks() {
+        let config = r#"
+models_base_url = ""
+api_key = ""
+
+[endpoints]
+models_base_url = "https://relay.example/v1"
+api_key = "endpoint-key"
+
+[models]
+default = "selected.model"
+
+[model."selected.model"]
+"#;
+
+        assert_eq!(
+            extract_grok_endpoint_string(config, "models_base_url").as_deref(),
+            Some("https://relay.example/v1")
+        );
+        assert_eq!(
+            extract_grok_model_string(config, "api_key").as_deref(),
+            Some("endpoint-key")
+        );
     }
 
     #[test]

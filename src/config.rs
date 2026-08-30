@@ -17,8 +17,7 @@ impl StoreLock {
         let parent = path
             .parent()
             .ok_or_else(|| "无效的配置锁路径".to_string())?;
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("创建配置锁目录 {} 失败: {e}", parent.display()))?;
+        ensure_private_dir(parent)?;
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -33,6 +32,42 @@ impl StoreLock {
 }
 
 impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+/// Serializes the first-run snapshots shared by the CLI and GUI.
+///
+/// The store lock only protects `providers.json`. Snapshot creation also
+/// reads and writes client credentials, so it needs a separate short-lived
+/// lock to prevent two processes from producing a mixed manifest and set of
+/// snapshot files during startup.
+pub struct SnapshotLock {
+    file: fs::File,
+}
+
+impl SnapshotLock {
+    fn acquire() -> Result<Self, String> {
+        let path = get_app_config_dir().join("snapshot.lock");
+        let parent = path
+            .parent()
+            .ok_or_else(|| "无效的快照锁路径".to_string())?;
+        ensure_private_dir(parent)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("打开快照锁 {} 失败: {error}", path.display()))?;
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|error| format!("获取快照锁 {} 失败: {error}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SnapshotLock {
     fn drop(&mut self) {
         let _ = fs2::FileExt::unlock(&self.file);
     }
@@ -63,8 +98,17 @@ pub fn get_store_lock_path() -> PathBuf {
     get_app_config_dir().join("providers.json.lock")
 }
 
+/// 确保 z-switch 自有配置根目录存在且仅当前用户可访问。
+pub fn ensure_app_config_dir() -> Result<(), String> {
+    ensure_private_dir(&get_app_config_dir())
+}
+
 pub fn lock_store() -> Result<StoreLock, String> {
     StoreLock::acquire()
+}
+
+pub fn lock_snapshots() -> Result<SnapshotLock, String> {
+    SnapshotLock::acquire()
 }
 
 /// z-switch 管理的本机账号凭据快照目录。

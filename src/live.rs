@@ -265,7 +265,9 @@ pub fn write_official_baseline(app: &str, backup: bool) -> Result<(), String> {
         }
         "codex" => {
             let auth = crate::official::codex_auth_for_restore()?;
-            write_codex_live(&auth, "", backup)
+            let current_config = fs::read_to_string(config::get_codex_config_path()).ok();
+            let config_text = codex_official_config_for_write(current_config.as_deref(), None);
+            write_codex_live(&auth, &config_text, backup)
         }
         other => Err(format!("未知应用: {other}")),
     }
@@ -322,9 +324,21 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
             .filter(|value| !value.trim().is_empty())
     }
 
+    fn is_root_legacy_endpoint(line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            return false;
+        }
+        trimmed
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "base_url")
+    }
+
     let provider_id = crate::store::extract_codex_provider_id(config_text)
         .or_else(|| config_text.lines().find_map(model_provider_id))
         .filter(|value| !value.is_empty() && value != "openai");
+    let has_non_official_provider = provider_id.is_some()
+        || crate::store::extract_root_toml_string(config_text, "base_url").is_some();
 
     let mut result = Vec::new();
     let mut skip_provider_table = false;
@@ -355,7 +369,15 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
         if skip_provider_table {
             continue;
         }
-        if !in_array_table && current_section.is_none() && model_provider_value(trimmed).is_some() {
+        if !in_array_table
+            && current_section.is_none()
+            && (model_provider_value(trimmed).is_some()
+                || is_root_legacy_endpoint(trimmed)
+                || (has_non_official_provider
+                    && trimmed
+                        .split_once('=')
+                        .is_some_and(|(key, _)| key.trim() == "model")))
+        {
             continue;
         }
         result.push(line);
@@ -369,6 +391,49 @@ fn sanitize_codex_official_config(config_text: &str) -> String {
     } else {
         result.join("\n") + "\n"
     }
+}
+
+/// Build the Codex config used by the official account card.
+///
+/// The official provider is intentionally stored without a third-party
+/// endpoint, so its card often has an empty `config` field. Prefer the live
+/// config when available to retain MCP, sandbox, and other shared settings;
+/// then remove the selected relay table and provider selector. The fallback
+/// provider config is used for a first-run official card that has already
+/// been hydrated from a valid official live config.
+fn codex_official_config_for_write(current: Option<&str>, fallback: Option<&str>) -> String {
+    let source = match current.filter(|value| !value.trim().is_empty()) {
+        Some(value) if codex_live_config_is_official(value) => value,
+        Some(value) => fallback
+            .filter(|fallback| !fallback.trim().is_empty())
+            .unwrap_or(value),
+        None => fallback
+            .filter(|fallback| !fallback.trim().is_empty())
+            .unwrap_or(""),
+    };
+    sanitize_codex_official_config(source)
+}
+
+/// 判断 Codex 当前 live 配置是否仍是官方 provider。
+///
+/// 官方卡片可以保存根级模型、推理等偏好，但不能从第三方 provider
+/// 或本地代理配置中回填这些字段。尤其是 `model_provider = "custom"`
+/// 时，根级 `model` 往往也是中转供应商专用模型。
+fn codex_live_config_is_official(config_text: &str) -> bool {
+    if crate::store::extract_codex_provider_id(config_text)
+        .is_some_and(|provider| provider != "openai")
+    {
+        return false;
+    }
+
+    // `model_provider = "openai"` 也可能配有自定义 base_url；无明确
+    // provider 的旧配置则只检查根级 base_url。两者都不应被官方卡片采纳。
+    let base_url = if crate::store::extract_codex_provider_id(config_text).is_some() {
+        crate::store::extract_codex_provider_string(config_text, "base_url")
+    } else {
+        crate::store::extract_root_toml_string(config_text, "base_url")
+    };
+    base_url.is_none()
 }
 
 pub fn hydrate_official_provider(app: &str, provider: &mut Provider) -> bool {
@@ -404,7 +469,13 @@ pub fn hydrate_official_provider(app: &str, provider: &mut Provider) -> bool {
                 return false;
             }
             let (_, live_config) = read_codex_live();
-            let sanitized = sanitize_codex_official_config(live_config.as_deref().unwrap_or(""));
+            let Some(live_config) = live_config else {
+                return false;
+            };
+            if !codex_live_config_is_official(&live_config) {
+                return false;
+            }
+            let sanitized = sanitize_codex_official_config(&live_config);
             if sanitized.trim().is_empty() {
                 return false;
             }
@@ -455,15 +526,17 @@ pub fn write_live(app: &str, provider: &Provider, backup: bool) -> Result<(), St
                     .cloned()
                     .unwrap_or_else(|| Value::Object(Map::new()))
             };
-            let mut cfg = provider
+            let provider_cfg = provider
                 .settings_config
                 .get("config")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if official {
-                cfg = sanitize_codex_official_config(&cfg);
-            }
+                .filter(|value| !value.trim().is_empty());
+            let cfg = if official {
+                let current_config = fs::read_to_string(config::get_codex_config_path()).ok();
+                codex_official_config_for_write(current_config.as_deref(), provider_cfg)
+            } else {
+                provider_cfg.unwrap_or("").to_string()
+            };
             write_codex_live(&auth, &cfg, backup)
         }
         "grok" => {
@@ -652,15 +725,29 @@ pub fn snapshot_proxy_port(snapshot: &AppLiveSnapshot, app: &str) -> Option<u16>
 
 fn proxy_port_from_base(app: &str, base: &str) -> Option<u16> {
     let url = reqwest::Url::parse(base).ok()?;
-    if !crate::repair::is_localhost(url.as_str()) {
+    // This parser is used to decide whether it is safe to take over a live
+    // configuration. Do not classify every localhost URL as ours: local
+    // model servers and the GUI may use the same loopback space. Match the
+    // exact shape emitted by `proxy::local_base` instead.
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return None;
     }
 
     // z-switch 写入的 live 代理地址固定为
-    // `http://127.0.0.1:<port>/<app>`。仅凭 localhost 不能区分本地
-    // Ollama/LM Studio 等真实上游，否则直连本地模型会被误判为外部代理。
+    // `http://127.0.0.1:<port>/<app>`，并且总是带显式端口。仅凭 localhost
+    // 不能区分本地 Ollama/LM Studio 等真实上游，否则直连本地模型会被误判
+    // 为外部代理。
     let expected_path = format!("/{app}");
-    (url.path().trim_end_matches('/') == expected_path).then(|| url.port_or_known_default())?
+    if url.path() != expected_path && url.path() != format!("{expected_path}/") {
+        return None;
+    }
+    url.port()
 }
 
 pub fn import_claude() -> Option<Provider> {
@@ -788,6 +875,26 @@ mod tests {
             proxy_port_from_base("claude", "https://api.example.com/claude"),
             None
         );
+        assert_eq!(
+            proxy_port_from_base("claude", "https://127.0.0.1:8999/claude"),
+            None
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "http://localhost:8999/claude"),
+            None
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "http://[::1]:8999/claude"),
+            None
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "http://127.0.0.1/claude"),
+            None
+        );
+        assert_eq!(
+            proxy_port_from_base("claude", "http://127.0.0.1:8999/claude?source=local"),
+            None
+        );
     }
 
     #[test]
@@ -806,7 +913,7 @@ mod tests {
             files: vec![LiveFileSnapshot {
                 path: config::get_codex_config_path(),
                 content: Some(
-                    b"model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"http://localhost:9234/codex\"\n"
+                    b"model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:9234/codex\"\n"
                         .to_vec(),
                 ),
             }],
@@ -838,6 +945,14 @@ mod tests {
     }
 
     #[test]
+    fn proxy_port_ignores_non_http_localhost_urls() {
+        assert_eq!(
+            proxy_port_from_base("claude", "ftp://127.0.0.1:8999/claude"),
+            None
+        );
+    }
+
+    #[test]
     fn official_codex_config_removes_commented_provider_table() {
         let input = r#"model_provider = "custom" # selected relay
 model = "gpt-5"
@@ -854,8 +969,84 @@ command = "docs"
         let output = sanitize_codex_official_config(input);
         assert!(!output.contains("model_provider ="));
         assert!(!output.contains("relay.example"));
-        assert!(output.contains("model = \"gpt-5\""));
+        assert!(!output.contains("model = \"gpt-5\""));
         assert!(output.contains("[mcp_servers.docs]"));
+    }
+
+    #[test]
+    fn codex_official_hydration_rejects_third_party_live_config() {
+        let input = r#"model_provider = "custom"
+model = "relay-model"
+
+[model_providers.custom]
+base_url = "https://relay.example/v1"
+"#;
+
+        assert!(!codex_live_config_is_official(input));
+        assert!(codex_live_config_is_official("model = \"gpt-5\"\n"));
+        assert!(codex_live_config_is_official(
+            "[mcp_servers.docs]\nbase_url = \"https://docs.example\"\n"
+        ));
+    }
+
+    #[test]
+    fn official_codex_write_preserves_common_live_config() {
+        let input = r#"model_provider = "custom"
+model = "relay-model"
+
+[model_providers.custom]
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+
+[mcp_servers.docs]
+command = "docs"
+"#;
+
+        let output = codex_official_config_for_write(Some(input), None);
+        assert!(!output.contains("model_provider ="));
+        assert!(!output.contains("relay.example"));
+        assert!(!output.contains("model = \"relay-model\""));
+        assert!(output.contains("[mcp_servers.docs]"));
+    }
+
+    #[test]
+    fn official_codex_write_prefers_official_fallback_over_relay_live() {
+        let current = r#"model_provider = "custom"
+model = "relay-model"
+
+[model_providers.custom]
+base_url = "https://relay.example/v1"
+"#;
+        let fallback = "model = \"gpt-5\"\n[mcp_servers.docs]\ncommand = \"docs\"\n";
+
+        let output = codex_official_config_for_write(Some(current), Some(fallback));
+        assert!(output.contains("model = \"gpt-5\""));
+        assert!(!output.contains("relay-model"));
+        assert!(!output.contains("relay.example"));
+        assert!(output.contains("[mcp_servers.docs]"));
+    }
+
+    #[test]
+    fn official_codex_write_removes_legacy_root_endpoint() {
+        let input = r#"model_provider = "custom"
+model = "relay-model"
+base_url = "https://relay.example/v1"
+
+[mcp_servers.docs]
+base_url = "https://docs.example"
+"#;
+
+        let output = sanitize_codex_official_config(input);
+        assert!(!output.contains("https://relay.example/v1"));
+        assert!(output.contains("base_url = \"https://docs.example\""));
+    }
+
+    #[test]
+    fn official_codex_write_uses_hydrated_fallback_when_live_is_empty() {
+        let fallback = "model = \"gpt-5\"\n[mcp_servers.docs]\ncommand = \"docs\"\n";
+        let output = codex_official_config_for_write(Some("\n"), Some(fallback));
+        assert_eq!(output, fallback);
     }
 
     #[test]

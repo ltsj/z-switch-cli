@@ -216,6 +216,11 @@ impl ProxyHandle {
     }
     pub fn is_routed(&self, app: &str) -> bool {
         self.routed.read().map(|s| s.contains(app)).unwrap_or(false)
+            || self
+                .targets
+                .read()
+                .map(|targets| targets.map.contains_key(app))
+                .unwrap_or(false)
     }
     pub fn set_routed(&self, app: &str, on: bool) {
         if let Ok(mut s) = self.routed.write() {
@@ -227,7 +232,17 @@ impl ProxyHandle {
         }
     }
     pub fn routed_count(&self) -> usize {
-        self.routed.read().map(|s| s.len()).unwrap_or(0)
+        let marked = self
+            .routed
+            .read()
+            .map(|set| set.clone())
+            .unwrap_or_default();
+        let targets = self
+            .targets
+            .read()
+            .map(|targets| targets.map.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        marked.union(&targets).count()
     }
     pub fn counters(&self, app: &str) -> Option<&AppCounters> {
         self.counters.get(app)
@@ -316,6 +331,7 @@ pub struct AdminSwitchResponse {
 pub struct ProxyControl {
     pub handle: ProxyHandle,
     shutdown: Option<oneshot::Sender<()>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl ProxyControl {
@@ -323,6 +339,7 @@ impl ProxyControl {
         Self {
             handle,
             shutdown: None,
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -335,8 +352,10 @@ impl ProxyControl {
         if port == 0 {
             return Err("代理端口必须在 1 到 65535 之间".into());
         }
-        self.stop();
         let addr = format!("127.0.0.1:{port}");
+        // Bind the replacement listener before stopping the current one. If
+        // the new port is occupied, a failed restart must leave the existing
+        // proxy serving traffic instead of taking down a healthy instance.
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("代理端口 {port} 绑定失败 (可能被占用): {e}"))?;
@@ -348,6 +367,11 @@ impl ProxyControl {
             .build()
             .map_err(|e| format!("构建代理 HTTP 客户端失败: {e}"))?;
 
+        self.stop();
+        // A previous server task may still be draining after stop(). Give the
+        // replacement a generation so the old task cannot clear the shared
+        // running flag after the new listener has started.
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.handle.reset_counters();
         let (admin_shutdown_tx, mut admin_shutdown_rx) = mpsc::channel::<()>(1);
         let runtime = Arc::new(Runtime {
@@ -378,6 +402,7 @@ impl ProxyControl {
         self.handle.running.store(true, Ordering::SeqCst);
 
         let running = self.handle.running.clone();
+        let current_generation = self.generation.clone();
         tokio::spawn(async move {
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 tokio::select! {
@@ -388,7 +413,9 @@ impl ProxyControl {
             if let Err(e) = server.await {
                 eprintln!("[z-switch] 代理服务退出: {e}");
             }
-            running.store(false, Ordering::SeqCst);
+            if current_generation.load(Ordering::SeqCst) == generation {
+                running.store(false, Ordering::SeqCst);
+            }
         });
         Ok(())
     }
@@ -1472,6 +1499,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_handle_treats_targets_as_routed_apps() {
+        let handle = ProxyHandle::default();
+        assert!(!handle.is_routed("claude"));
+
+        set_target(
+            &handle.targets,
+            "claude",
+            AppTarget {
+                base_url: "https://api.example".into(),
+                headers: Vec::new(),
+            },
+        );
+
+        assert!(handle.is_routed("claude"));
+        assert_eq!(handle.routed_count(), 1);
+    }
+
+    #[test]
     fn target_from_provider_rejects_proxy_placeholder_key() {
         let provider = Provider {
             id: "corrupt-claude".into(),
@@ -1727,6 +1772,103 @@ base_url = "https://array.example"
         );
     }
 
+    #[tokio::test]
+    async fn failed_start_keeps_existing_proxy_running() {
+        let mut control = ProxyControl::new(ProxyHandle::default());
+        let old_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind old port");
+        let old_port = old_listener.local_addr().expect("old address").port();
+        drop(old_listener);
+
+        control
+            .start(old_port, ProxyRuntimeConfig::default(), "old-token".into())
+            .await
+            .expect("start old proxy");
+
+        let blocker = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind occupied port");
+        let occupied_port = blocker.local_addr().expect("occupied address").port();
+        let error = control
+            .start(
+                occupied_port,
+                ProxyRuntimeConfig::default(),
+                "new-token".into(),
+            )
+            .await
+            .expect_err("occupied replacement port must fail");
+        assert!(error.contains("绑定失败"));
+        assert!(control.handle.is_running());
+
+        let health = crate::daemon::check_health(old_port)
+            .await
+            .expect("old proxy remains reachable");
+        assert_eq!(health.port, old_port);
+
+        drop(blocker);
+        control.stop();
+        let started = std::time::Instant::now();
+        while !crate::daemon::is_port_bindable(old_port).await
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(crate::daemon::is_port_bindable(old_port).await);
+    }
+
+    #[tokio::test]
+    async fn old_server_exit_cannot_clear_replacement_running_state() {
+        let mut control = ProxyControl::new(ProxyHandle::default());
+        let first_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind first port");
+        let first_port = first_listener.local_addr().expect("first address").port();
+        drop(first_listener);
+        let second_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind second port");
+        let second_port = second_listener.local_addr().expect("second address").port();
+        drop(second_listener);
+        assert_ne!(first_port, second_port);
+
+        control
+            .start(
+                first_port,
+                ProxyRuntimeConfig::default(),
+                "first-token".into(),
+            )
+            .await
+            .expect("start first proxy");
+        control
+            .start(
+                second_port,
+                ProxyRuntimeConfig::default(),
+                "second-token".into(),
+            )
+            .await
+            .expect("start replacement proxy");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(control.handle.is_running());
+        assert_eq!(control.handle.current_port(), second_port);
+        assert_eq!(
+            crate::daemon::check_health(second_port).await.unwrap().port,
+            second_port
+        );
+
+        control.stop();
+        let started = std::time::Instant::now();
+        while (!crate::daemon::is_port_bindable(first_port).await
+            || !crate::daemon::is_port_bindable(second_port).await)
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(crate::daemon::is_port_bindable(first_port).await);
+        assert!(crate::daemon::is_port_bindable(second_port).await);
+    }
+
     #[test]
     fn connection_header_declared_names_are_treated_as_hop_by_hop() {
         let names = hop_by_hop_headers([
@@ -1774,6 +1916,148 @@ base_url = "https://array.example"
         assert!(forwarded.get("authorization").is_none());
         assert!(forwarded.get("connection").is_none());
         assert!(forwarded.get("x-request-only").is_none());
+    }
+
+    #[derive(Default)]
+    struct MockRequestCapture {
+        path_and_query: String,
+        authorization: Vec<String>,
+        cookies: Vec<String>,
+        target_values: Vec<String>,
+        removed_values: Vec<String>,
+        body: Vec<u8>,
+    }
+
+    async fn mock_upstream(
+        State(capture): State<Arc<std::sync::Mutex<MockRequestCapture>>>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Response {
+        let body = axum::body::to_bytes(body, 2 * 1024 * 1024)
+            .await
+            .expect("mock request body");
+        let values = |name: &str| {
+            headers
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let mut saved = capture.lock().expect("mock capture lock");
+        saved.path_and_query = uri
+            .path_and_query()
+            .map_or_else(|| uri.path().to_string(), ToString::to_string);
+        saved.authorization = values("authorization");
+        saved.cookies = values("cookie");
+        saved.target_values = values("x-target");
+        saved.removed_values = values("x-remove");
+        saved.body = body.to_vec();
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("x-upstream", "first")
+            .header("x-upstream", "second")
+            .body(Body::from("data: first\n\ndata: [DONE]\n\n"))
+            .expect("mock response")
+    }
+
+    #[tokio::test]
+    async fn forward_real_http_preserves_routing_and_stream_response_contract() {
+        let capture = Arc::new(std::sync::Mutex::new(MockRequestCapture::default()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind upstream");
+        let upstream_addr = upstream_listener.local_addr().expect("upstream address");
+        let upstream_app = Router::new()
+            .fallback(mock_upstream)
+            .with_state(capture.clone());
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app)
+                .await
+                .expect("mock upstream server");
+        });
+
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("proxy address");
+        let targets = Arc::new(RwLock::new(ProxyTargets::default()));
+        set_target(
+            &targets,
+            "claude",
+            AppTarget {
+                base_url: format!("http://{upstream_addr}/v1?base=1"),
+                headers: vec![
+                    ("authorization".into(), "Bearer target-key".into()),
+                    ("x-target".into(), "first".into()),
+                    ("x-target".into(), "second".into()),
+                    ("cookie".into(), "target-cookie".into()),
+                ],
+            },
+        );
+        let runtime = Arc::new(Runtime {
+            client: reqwest::Client::new(),
+            targets,
+            config: ProxyRuntimeConfig::default(),
+            error_log_lock: tokio::sync::Mutex::new(()),
+            counters: HashMap::new(),
+            port: proxy_addr.port(),
+            shutdown_sender: mpsc::channel(1).0,
+            admin_token: "test-token".into(),
+        });
+        let proxy_app = Router::new()
+            .route("/{app}/{*rest}", any(forward))
+            .route("/{app}", any(forward))
+            .with_state(runtime);
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, proxy_app)
+                .await
+                .expect("proxy server");
+        });
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.append("authorization", "Bearer client-key".parse().unwrap());
+        request_headers.append("cookie", "client=one".parse().unwrap());
+        request_headers.append("cookie", "client=two".parse().unwrap());
+        request_headers.insert("connection", "x-remove".parse().unwrap());
+        request_headers.insert("x-remove", "must-not-forward".parse().unwrap());
+        request_headers.insert("accept", "text/event-stream".parse().unwrap());
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/claude/v1/messages?request=2"))
+            .headers(request_headers)
+            .body(r#"{"stream":true,"message":"hi"}"#)
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get_all("x-upstream")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            response.text().await.expect("SSE response body"),
+            "data: first\n\ndata: [DONE]\n\n"
+        );
+
+        let saved = capture.lock().expect("mock capture lock");
+        assert_eq!(saved.path_and_query, "/v1/messages?base=1&request=2");
+        assert_eq!(saved.authorization, vec!["Bearer target-key"]);
+        assert_eq!(saved.cookies, vec!["target-cookie"]);
+        assert_eq!(saved.target_values, vec!["first", "second"]);
+        assert!(saved.removed_values.is_empty());
+        assert_eq!(saved.body, br#"{"stream":true,"message":"hi"}"#.to_vec());
+
+        proxy_task.abort();
+        upstream_task.abort();
     }
 
     fn runtime_for_test(token: &str) -> Runtime {
