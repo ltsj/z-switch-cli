@@ -2,7 +2,9 @@
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
-use std::io::{self, Write};
+#[cfg(windows)]
+use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct StoreLock {
@@ -167,7 +169,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
     #[cfg(windows)]
     let result = replace_file_windows(&tmp, path);
     #[cfg(not(windows))]
-    let result = fs::rename(&tmp, path).map_err(io::Error::from);
+    let result = fs::rename(&tmp, path);
 
     result.map_err(|e| {
         let _ = fs::remove_file(&tmp);
